@@ -29,6 +29,7 @@ import { ShutdownModule } from './common/shutdown/shutdown.module';
 import { DrainMiddleware } from './common/shutdown/drain.middleware';
 
 import { AuditModule } from './audit/audit.module';
+import { TracingModule } from './monitoring/tracing.module';
 
 @Module({
   imports: [
@@ -59,6 +60,7 @@ import { AuditModule } from './audit/audit.module';
     SorobanEventIndexerModule,
     OutboxModule,
     AuditModule,
+    TracingModule,
   ],
 })
 export class AppModule implements NestModule {
