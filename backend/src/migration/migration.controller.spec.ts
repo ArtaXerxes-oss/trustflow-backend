@@ -1,9 +1,10 @@
-import { ExecutionContext } from '@nestjs/common';
+import { BadRequestException, ExecutionContext, ValidationPipe } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Test, TestingModule } from '@nestjs/testing';
 import { MigrationController } from './migration.controller';
 import { MigrationRunnerService } from './migration-runner.service';
 import { MigrationRegistryService } from './migration-registry.service';
+import { RunMigrationDto } from './migration.dto';
 import { JwtAuthGuard } from '../auth/auth.guard';
 import { AdminGuard } from '../admin/admin.guard';
 import { validateEnv } from '../config/env.config';
@@ -51,6 +52,7 @@ describe('MigrationController', () => {
     findById: jest.fn(),
     run: jest.fn(),
     rollback: jest.fn(),
+    markApplied: jest.fn(),
   };
 
   const mockRegistry = {
@@ -109,6 +111,57 @@ describe('MigrationController', () => {
     expect(mockRunner.run).toHaveBeenCalledWith('gigs-add-priority-column', dto);
   });
 
+  it('forwards dryRun through to the runner', async () => {
+    const dto = { dryRun: true };
+    mockRunner.run.mockResolvedValue({ runId: 'mig-1' });
+
+    await controller.run('gigs-add-priority-column', dto);
+
+    expect(mockRunner.run).toHaveBeenCalledWith('gigs-add-priority-column', {
+      dryRun: true,
+    });
+  });
+
+  describe('RunMigrationDto validation', () => {
+    const pipe = new ValidationPipe({
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: true,
+    });
+
+    function transform(body: Record<string, unknown>) {
+      return pipe.transform(body, { type: 'body', metatype: RunMigrationDto });
+    }
+
+    it('accepts dryRun as a boolean', async () => {
+      const dto = (await transform({ dryRun: true })) as RunMigrationDto;
+
+      expect(dto).toBeInstanceOf(RunMigrationDto);
+      expect(dto.dryRun).toBe(true);
+    });
+
+    it('rejects a non-boolean dryRun', async () => {
+      await expect(transform({ dryRun: 'yes' })).rejects.toBeInstanceOf(BadRequestException);
+    });
+  });
+
+  describe('markApplied()', () => {
+    it('delegates to the runner with migration name and dto', async () => {
+      const dto = { reason: 'Applied manually during incident' };
+      mockRunner.markApplied.mockResolvedValue({
+        runId: 'mig-1',
+        migrationName: 'gigs-add-priority-column',
+        status: 'COMPLETED',
+        auditNote: 'Applied manually during incident',
+      });
+
+      const result = await controller.markApplied('gigs-add-priority-column', dto);
+
+      expect(mockRunner.markApplied).toHaveBeenCalledWith('gigs-add-priority-column', dto);
+      expect(result.status).toBe('COMPLETED');
+    });
+  });
+
   it('rollback delegates to the runner with the run id', async () => {
     mockRunner.rollback.mockResolvedValue({ runId: 'mig-1', status: 'ROLLED_BACK' });
 
@@ -164,5 +217,16 @@ describe('MigrationController', () => {
 
       expect(mockRunner.rollback).toHaveBeenCalledWith('mig-1');
     });
+  });
+  it('forwards the acting admin wallet address from req.user to runner.run and runner.rollback (#905)', async () => {
+    mockRunner.run.mockResolvedValue({ runId: 'mig-1' });
+    mockRunner.rollback.mockResolvedValue({ runId: 'mig-1', status: 'ROLLED_BACK' });
+
+    const req = { user: { address: 'GADMIN1234567890' } } as any;
+    await controller.run('gigs-add-priority-column', { batchSize: 50 }, req);
+    expect(mockRunner.run).toHaveBeenCalledWith('gigs-add-priority-column', { batchSize: 50 }, 'GADMIN1234567890');
+
+    await controller.rollback('mig-1', req);
+    expect(mockRunner.rollback).toHaveBeenCalledWith('mig-1', 'GADMIN1234567890');
   });
 });

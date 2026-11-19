@@ -18,6 +18,8 @@ import {
   CastVoteDto,
   ExecutePayoutDto,
   DisputeSagaResponseDto,
+  SubmitEvidenceDto,
+  DisputeEvidenceDto,
 } from './dispute.dto';
 import { JwtAuthGuard } from '../auth/auth.guard';
 import { AdminGuard } from '../admin/admin.guard';
@@ -95,6 +97,28 @@ export class DisputeSagaController {
     return this.sagaService.escalate(escrowId, escalateDto);
   }
 
+  @Post(':sagaId/evidence')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary: 'Attach dispute evidence',
+    description:
+      'Pins a base64-encoded evidence file to IPFS and records its CID on the saga. ' +
+      'The same 10 MB decoded size limit as deliverable uploads is enforced on the raw ' +
+      'request before any content is decoded or forwarded to pinning storage.',
+  })
+  @ApiParam({ name: 'sagaId', example: 'saga-1234567890-abc' })
+  @ApiResponse({ status: 201, type: DisputeEvidenceDto })
+  @ApiResponse({ status: 400, description: 'Invalid or oversized evidence content' })
+  @ApiResponse({ status: 403, description: 'Caller is not a party to the dispute' })
+  @ApiResponse({ status: 404, description: 'Saga not found' })
+  attachEvidence(
+    @Param('sagaId') sagaId: string,
+    @Body() dto: SubmitEvidenceDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.sagaService.attachEvidence(sagaId, dto, req.user.address);
+  }
+
   @Post(':sagaId/assign-jurors')
   @UseGuards(AdminGuard)
   @HttpCode(HttpStatus.OK)
@@ -124,9 +148,14 @@ export class DisputeSagaController {
   @ApiParam({ name: 'sagaId', example: 'saga-1234567890-abc' })
   @ApiResponse({ status: 200, type: DisputeSagaResponseDto })
   @ApiResponse({ status: 400, description: 'Juror not assigned or saga not at VOTING step' })
+  @ApiResponse({ status: 403, description: 'Authenticated wallet does not match juror address' })
   @ApiResponse({ status: 409, description: 'Juror has already voted' })
-  castVote(@Param('sagaId') sagaId: string, @Body() dto: CastVoteDto) {
-    return this.sagaService.castVote(sagaId, dto);
+  castVote(
+    @Param('sagaId') sagaId: string,
+    @Body() dto: CastVoteDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.sagaService.castVote(sagaId, dto, req.user?.address);
   }
 
   @Post(':sagaId/payout')

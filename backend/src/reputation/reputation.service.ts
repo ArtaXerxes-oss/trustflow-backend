@@ -8,8 +8,10 @@ import {
   REPUTATION_MAX_AMOUNT_WEIGHT,
   REPUTATION_RECENT_EVENTS_LIMIT,
   REPUTATION_WEIGHTS,
+  ReputationBreakdownEntry,
   ReputationEventType,
   ReputationOutcome,
+  ReputationScoreBreakdown,
   ReputationScoreRecord,
   ReputationScoreView,
 } from './reputation.types';
@@ -127,6 +129,36 @@ export class ReputationService {
     return this.toView(record);
   }
 
+  /**
+   * Itemized breakdown of the events, weights, and dampening behind an address's current
+   * score, so a wallet owner or admin can understand or contest it instead of needing a
+   * direct database query (#989). See `ReputationBreakdownEntry`'s doc comment for how
+   * `decayedContribution` relates (loosely, for illustration) to the aggregate `score`.
+   */
+  async getScoreBreakdown(address: string): Promise<ReputationScoreBreakdown> {
+    const now = new Date();
+    const existing = await this.store.get(address);
+    const record = existing ? this.decay(existing, now) : this.emptyRecord(address, now);
+
+    const events: ReputationBreakdownEntry[] = record.recentEvents.map(event => {
+      const elapsedMs = now.getTime() - new Date(event.occurredAt).getTime();
+      const decayFactor =
+        elapsedMs > 0 ? Math.pow(0.5, elapsedMs / REPUTATION_DECAY_HALF_LIFE_MS) : 1;
+      return {
+        ...event,
+        decayedContribution: Math.round(event.contribution * decayFactor * 100) / 100,
+      };
+    });
+
+    return {
+      address: record.address,
+      score: Math.round(record.score * 100) / 100,
+      eventCount: record.eventCount,
+      lastUpdatedAt: record.lastUpdatedAt,
+      events,
+    };
+  }
+
   /** Count of distinct addresses with a materialized score record, for admin/analytics use. */
   async getTrackedAddressCount(): Promise<number> {
     return (await this.store.findAll()).length;
@@ -181,14 +213,23 @@ export class ReputationService {
 
       const priorInteractions = record.counterpartyCounts[counterparty] ?? 0;
       const dampeningFactor = 1 / (1 + priorInteractions);
-      const contribution =
-        REPUTATION_WEIGHTS[type] * this.amountWeight(amountXLM) * dampeningFactor;
+      const baseWeight = REPUTATION_WEIGHTS[type];
+      const amountWeight = this.amountWeight(amountXLM);
+      const contribution = baseWeight * amountWeight * dampeningFactor;
 
       record.score += contribution;
       record.eventCount += 1;
       record.counterpartyCounts[counterparty] = priorInteractions + 1;
       record.recentEvents = [
-        { type, counterparty, contribution, occurredAt: now.toISOString() },
+        {
+          type,
+          counterparty,
+          contribution,
+          occurredAt: now.toISOString(),
+          baseWeight,
+          amountWeight,
+          dampeningFactor,
+        },
         ...record.recentEvents,
       ].slice(0, REPUTATION_RECENT_EVENTS_LIMIT);
       record.lastUpdatedAt = now.toISOString();
@@ -228,7 +269,14 @@ export class ReputationService {
     try {
       const amount = parseAmount(amountXLM).toNumber();
       if (!Number.isFinite(amount) || amount <= 0) return 0;
-      return Math.min(Math.sqrt(amount), REPUTATION_MAX_AMOUNT_WEIGHT);
+      // Logarithmic rather than merely bounded-sqrt scaling (#977): a sqrt cap this low
+      // (10, reached at just 100 XLM) made every gig at or above a fairly ordinary budget
+      // contribute identically — a 100 XLM gig and a 50,000 XLM gig both saturated the cap
+      // and scored the same. log10 keeps differentiating budgets across many more orders
+      // of magnitude before the cap (now reached only around 1 billion XLM) ever applies,
+      // so the cap still exists purely as a whale/overflow guard, not as the thing nearly
+      // every real gig collides into.
+      return Math.min(1 + Math.log10(Math.max(amount, 1)), REPUTATION_MAX_AMOUNT_WEIGHT);
     } catch {
       return 0;
     }

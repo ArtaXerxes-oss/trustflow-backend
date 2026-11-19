@@ -8,7 +8,6 @@ import {
   Optional,
 } from '@nestjs/common';
 import { SanitizedLogger } from '../common/logging/sanitized-logger';
-import { amountGreaterThanOrEqual, amountLessThanOrEqual } from '../common/amount';
 import { createHash } from 'crypto';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
@@ -20,8 +19,6 @@ import { MetricsService } from '../monitoring/metrics.service';
 import { CreateGigDto, SearchGigsQuery, UpdateGigDto } from './gig.dto';
 import {
   DEFAULT_GIG_SEARCH_CACHE_TTL_SECONDS,
-  DEFAULT_GIG_SEARCH_LIMIT,
-  DEFAULT_GIG_SEARCH_PAGE,
   DEFAULT_RESPONSE_WINDOW_HOURS,
   GIG_EVENTS,
   Gig,
@@ -29,7 +26,11 @@ import {
   PaginatedGigs,
 } from './gig.entity';
 import { OutboxService } from '../outbox/outbox.service';
+import { EscrowService } from '../escrow/escrow.service';
 import { config } from '../config/env.config';
+import { amountGreaterThanOrEqual, amountLessThanOrEqual } from '../common/amount';
+import { normalizePagination, paginate } from '../common/pagination';
+import { excludeSoftDeleted } from '../common/database/soft-delete';
 
 const GIG_KEY_PREFIX = 'gig:';
 const GIGS_INDEX_KEY = 'gigs:index';
@@ -62,6 +63,7 @@ export class GigService implements OnModuleInit {
     @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
     private readonly metrics: MetricsService,
     @Optional() private readonly outbox?: OutboxService,
+    @Optional() private readonly escrowService?: EscrowService,
   ) {}
 
   /**
@@ -93,6 +95,8 @@ export class GigService implements OnModuleInit {
       createdAt: now.toISOString(),
       respondBy: new Date(now.getTime() + windowHours * 60 * 60 * 1000).toISOString(),
       version: 1,
+      escrowId: dto.escrowId,
+      reservationId: dto.reservationId,
     };
 
     const event = this.outbox?.create(GIG_EVENTS.GIG_CREATED, 'gig', id, gig);
@@ -163,6 +167,7 @@ export class GigService implements OnModuleInit {
       gigs = [...this.gigs.values()].filter(g => g.creator === address);
     }
 
+    gigs = excludeSoftDeleted(gigs);
     if (options?.status) {
       gigs = gigs.filter(g => g.status === options.status);
     }
@@ -178,6 +183,15 @@ export class GigService implements OnModuleInit {
     const limit = options?.limit ?? 20;
     const data = gigs.slice(offset, offset + limit);
     return { data, total };
+  }
+
+  /**
+   * Return all gigs with the given status.
+   * Used by the milestone expiry scheduler to find open gigs nearing deadline.
+   */
+  async findByStatus(status: GigStatus): Promise<Gig[]> {
+    const all = await this.findAll();
+    return all.filter(g => g.status === status);
   }
 
   /** Open gig solicitations whose response deadline has passed as of `now`. */
@@ -204,8 +218,7 @@ export class GigService implements OnModuleInit {
    */
   async search(query: SearchGigsQuery = {}): Promise<PaginatedGigs> {
     const status = query.status ?? GigStatus.OPEN;
-    const page = query.page ?? DEFAULT_GIG_SEARCH_PAGE;
-    const limit = query.limit ?? DEFAULT_GIG_SEARCH_LIMIT;
+    const { page, limit } = normalizePagination(query);
     const cacheKey = this.searchCacheKey(
       status,
       page,
@@ -229,14 +242,7 @@ export class GigService implements OnModuleInit {
       filtered = filtered.filter(g => amountLessThanOrEqual(g.budgetXLM, query.maxBudgetXLM));
     }
 
-    const total = filtered.length;
-    const start = (page - 1) * limit;
-    const result: PaginatedGigs = {
-      items: filtered.slice(start, start + limit),
-      total,
-      page,
-      limit,
-    };
+    const result: PaginatedGigs = paginate(filtered, { page, limit });
 
     await this.writeSearchCache(cacheKey, result);
     return result;
@@ -301,7 +307,7 @@ export class GigService implements OnModuleInit {
   async accept(id: string, responder: string): Promise<Gig> {
     return this.mutateWithRetry(id, async gig => {
       if (gig.status !== GigStatus.OPEN) {
-        throw new ConflictException(`Cannot accept a gig with status "${gig.status}"`);
+        throw new BadRequestException(`Cannot accept a gig with status "${gig.status}"`);
       }
       gig.status = GigStatus.ACCEPTED;
       gig.acceptedBy = responder;
@@ -315,20 +321,49 @@ export class GigService implements OnModuleInit {
   async cancel(id: string): Promise<Gig> {
     return this.mutateWithRetry(id, async gig => {
       if (gig.status !== GigStatus.OPEN) {
-        throw new ConflictException(`Cannot cancel a gig with status "${gig.status}"`);
+        throw new BadRequestException(`Cannot cancel a gig with status "${gig.status}"`);
       }
       gig.status = GigStatus.CANCELLED;
       gig.cancelledAt = new Date().toISOString();
       gig.version = (gig.version || 1) + 1;
       await this.persistResolved(gig, GIG_EVENTS.GIG_CANCELLED);
+      await this.releaseReservedFunds(gig);
       return gig;
     });
+  }
+
+  /**
+   * Releases any tentatively reserved funds or linked escrow records when a gig is expired
+   * or cancelled unaccepted.
+   */
+  private async releaseReservedFunds(gig: Gig): Promise<void> {
+    if (gig.escrowId && this.escrowService) {
+      try {
+        await this.escrowService.cancel(gig.escrowId);
+        this.logger.log(`Released escrow reservation ${gig.escrowId} for gig ${gig.id}`);
+      } catch (err) {
+        this.logger.error(
+          `Failed to release escrow reservation ${gig.escrowId} for gig ${gig.id}`,
+          err,
+        );
+      }
+    }
+    if (this.redis) {
+      try {
+        if (gig.reservationId) {
+          await this.redis.del(`reservation:${gig.reservationId}`);
+        }
+        await this.redis.del(`gig:${gig.id}:reservation`);
+      } catch (err) {
+        this.logger.error(`Failed to delete Redis reservation keys for gig ${gig.id}`, err);
+      }
+    }
   }
 
   async update(id: string, dto: UpdateGigDto): Promise<Gig> {
     return this.mutateWithRetry(id, async gig => {
       if (gig.status !== GigStatus.OPEN) {
-        throw new ConflictException(`Cannot update a gig with status "${gig.status}"`);
+        throw new BadRequestException(`Cannot update a gig with status "${gig.status}"`);
       }
       if (dto.title !== undefined) gig.title = dto.title;
       if (dto.budgetXLM !== undefined) gig.budgetXLM = dto.budgetXLM;
@@ -346,13 +381,14 @@ export class GigService implements OnModuleInit {
   async remove(id: string): Promise<void> {
     return this.mutateWithRetry(id, async gig => {
       if (gig.status === GigStatus.ACCEPTED) {
-        throw new ConflictException('Cannot delete an accepted gig');
+        throw new BadRequestException('Cannot delete an accepted gig');
       }
+      gig.deletedAt = new Date().toISOString();
       if (this.redis) {
         try {
           const transaction = this.redis
             .multi()
-            .del(this.gigKey(id))
+            .set(this.gigKey(id), JSON.stringify(gig))
             .zrem(GIGS_INDEX_KEY, id)
             .zrem(GIGS_OPEN_BY_RESPOND_BY_KEY, id)
             .srem(this.creatorKey(gig.creator), id);
@@ -367,7 +403,7 @@ export class GigService implements OnModuleInit {
           this.logFallback('remove', err);
         }
       }
-      this.gigs.delete(id);
+      this.gigs.set(id, gig);
       await this.invalidateSearchCache();
     });
   }
@@ -383,6 +419,7 @@ export class GigService implements OnModuleInit {
       gig.expiredAt = new Date().toISOString();
       gig.version = (gig.version || 1) + 1;
       await this.persistResolved(gig, GIG_EVENTS.GIG_EXPIRED);
+      await this.releaseReservedFunds(gig);
       return gig;
     });
   }

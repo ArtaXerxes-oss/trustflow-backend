@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Controller,
+  ForbiddenException,
   Get,
   HttpCode,
   HttpStatus,
@@ -109,6 +110,67 @@ export class EscrowController {
       validated.beneficiary,
       validated.amountXLM,
     );
+  }
+
+  @Post('milestones/batch-approve')
+  @ApiOperation({
+    summary: 'Batch approve milestones',
+    description:
+      'Approves multiple pending milestones across different contracts in a single authenticated API call.',
+  })
+  @ApiBody({
+    description: 'Batch approval details',
+    schema: {
+      type: 'object',
+      required: ['milestoneIds', 'signerAddress'],
+      properties: {
+        milestoneIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of milestone IDs to approve',
+          example: ['ms-123', 'ms-456'],
+        },
+        signerAddress: {
+          type: 'string',
+          description: 'Stellar address of the approver (must be depositor)',
+          example: 'GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Batch approval result with succeeded and failed breakdown',
+    schema: {
+      type: 'object',
+      properties: {
+        succeeded: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              status: { type: 'string' },
+            },
+          },
+        },
+        failed: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              reason: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
+  })
+  @ApiResponse({ status: 400, description: 'Invalid request body' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async batchApproveMilestones(@Body() body: { milestoneIds: string[]; signerAddress: string }) {
+    return this.escrowService.batchApproveMilestones(body.milestoneIds, body.signerAddress);
   }
 
   @Get(':id')
@@ -286,6 +348,8 @@ export class EscrowController {
     },
   })
   @ApiResponse({ status: 400, description: 'Invalid or missing sourceAccount' })
+  @ApiResponse({ status: 400, description: 'Escrow is not in active status' })
+  @ApiResponse({ status: 403, description: 'Source account is not authorized to release the escrow' })
   @ApiResponse({ status: 404, description: 'Escrow not found or not linked to an on-chain escrow' })
   @ApiResponse({ status: 503, description: 'TRUSTFLOW_CONTRACT_ID is not configured' })
   async buildReleaseTransaction(
@@ -296,6 +360,20 @@ export class EscrowController {
     if (!escrow) throw new NotFoundException(`Escrow ${id} not found`);
     if (!escrow.contractEscrowId) {
       throw new NotFoundException(`Escrow ${id} is not yet linked to an on-chain escrow`);
+    }
+
+    // Only active escrows can be released
+    if (escrow.status !== 'active') {
+      throw new BadRequestException(
+        `Escrow ${id} is not in active status (current: ${escrow.status}). Only active escrows can be released.`,
+      );
+    }
+
+    // Only the depositor or beneficiary can release the escrow
+    if (sourceAccount !== escrow.depositor && sourceAccount !== escrow.beneficiary) {
+      throw new ForbiddenException(
+        `Source account ${sourceAccount} is not authorized to release escrow ${id}. Only the depositor or beneficiary can release.`,
+      );
     }
 
     return this.escrowReleaseTransactionBuilderService.buildRelease(

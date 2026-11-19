@@ -47,4 +47,20 @@ describe('createRedisClient (#220)', () => {
     await new Promise(r => setTimeout(r, 50));
     expect(error).toHaveBeenCalledWith(expect.stringContaining('Initial Redis connection failed'));
   });
+  it('configures reconnectOnError and retryStrategy for automatic recovery (#906)', () => {
+    process.env.REDIS_URL = 'redis://127.0.0.1:6379';
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+
+    const client = createRedisClient();
+    expect(client).not.toBeNull();
+    clients.push(client!);
+
+    const opts = client!.options;
+    expect(typeof opts.retryStrategy).toBe('function');
+    expect(typeof opts.reconnectOnError).toBe('function');
+    expect((opts.retryStrategy as Function)(5)).toBeLessThanOrEqual(3000);
+    expect((opts.reconnectOnError as Function)(new Error('READONLY'))).toBe(true);
+  });
 });

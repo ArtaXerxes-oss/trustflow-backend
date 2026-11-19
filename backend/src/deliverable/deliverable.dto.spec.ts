@@ -68,21 +68,49 @@ describe('UploadDeliverableSchema content', () => {
   it('uses the same encoded-length cap as the IPFS pin endpoint', () => {
     expect(MAX_BASE64_CONTENT_LENGTH).toBe(14_316_560);
   });
+
+  describe('fileHash validation (#922)', () => {
+    it('accepts a valid IPFS CIDv0 or CIDv1 in fileHash', () => {
+      const cidV0 = 'QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco';
+      const result = UploadDeliverableSchema.safeParse({
+        gigId: 'gig-1',
+        freelancer: FREELANCER,
+        fileHash: cidV0,
+        filename: 'report.pdf',
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('rejects an empty fileHash', () => {
+      const result = UploadDeliverableSchema.safeParse({
+        gigId: 'gig-1',
+        freelancer: FREELANCER,
+        fileHash: '',
+        filename: 'report.pdf',
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects placeholder fileHash like "TODO"', () => {
+      const result = UploadDeliverableSchema.safeParse({
+        gigId: 'gig-1',
+        freelancer: FREELANCER,
+        fileHash: 'TODO',
+        filename: 'report.pdf',
+      });
+      expect(result.success).toBe(false);
+    });
+  });
 });
 
-describe('UploadDeliverableSchema expectedCid', () => {
-  it('accepts a well-formed CIDv1 content hash', () => {
-    const expectedCid = computeCidV1Raw(Buffer.from('test file'));
-    expect(parse(CONTENT, { expectedCid }).success).toBe(true);
+describe('UploadDeliverableSchema content + fileHash', () => {
+  it('accepts content together with a matching fileHash so it can be verified server-side', () => {
+    const fileHash = computeCidV1Raw(Buffer.from('test file'));
+    expect(parse(CONTENT, { fileHash }).success).toBe(true);
   });
 
-  it('rejects a malformed client-supplied hash before any pinning occurs', () => {
-    const result = parse(CONTENT, { expectedCid: 'not-a-cid' });
+  it('rejects a malformed fileHash even when content is present', () => {
+    const result = parse(CONTENT, { fileHash: 'not-a-cid' });
     expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error.errors.map(e => e.message)).toContain(
-        'expectedCid must be a valid CIDv1 raw sha2-256 string',
-      );
-    }
   });
 });

@@ -12,6 +12,7 @@ import {
   RATE_LIMIT_DURATION,
   RATE_LIMIT_ON_REDIS_ERROR,
   RateLimitRedisErrorPolicy,
+  RateLimit,
 } from './rate-limit.decorator';
 import { validateEnv, getConfig, TEST_ONLY_JWT_SECRET } from '../../config/env.config';
 import { MetricsService } from '../../monitoring/metrics.service';
@@ -152,6 +153,7 @@ describe('RateLimitGuard', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         RateLimitGuard,
+        { provide: JwtService, useValue: new JwtService() },
         {
           provide: REDIS_CLIENT,
           useValue: mockRedis,
@@ -182,6 +184,7 @@ describe('RateLimitGuard', () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           RateLimitGuard,
+          { provide: JwtService, useValue: new JwtService() },
           { provide: REDIS_CLIENT, useValue: null },
           {
             provide: Reflector,
@@ -203,6 +206,7 @@ describe('RateLimitGuard', () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           RateLimitGuard,
+          { provide: JwtService, useValue: new JwtService() },
           { provide: REDIS_CLIENT, useValue: null },
           { provide: Reflector, useValue: createReflector() },
         ],
@@ -225,6 +229,7 @@ describe('RateLimitGuard', () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           RateLimitGuard,
+          { provide: JwtService, useValue: new JwtService() },
           { provide: REDIS_CLIENT, useValue: mockRedis },
           {
             provide: Reflector,
@@ -254,7 +259,7 @@ describe('RateLimitGuard', () => {
         'ratelimit:{ip:127.0.0.1:get:_auth_challenge}:bucket',
         'ratelimit:{ip:127.0.0.1:get:_auth_challenge}:lockout',
         'ratelimit:{ip:127.0.0.1:get:_auth_challenge}:abuse',
-        100,
+        60, // ANONYMOUS tier (no verified wallet) — see RATE_TIER_CONFIGS
         60_000,
         120_000,
         300_000,
@@ -265,10 +270,21 @@ describe('RateLimitGuard', () => {
       );
     });
 
+    it('should advertise RateLimit-* headers matching bucket state returned by Redis Lua script', async () => {
+      mockRedis.queueResults([[null, [1, 42]]]); // allowed, 42 remaining
+
+      const { context, response } = mockContext();
+      await expect(guard.canActivate(context)).resolves.toBe(true);
+
+      expect(response.setHeader).toHaveBeenCalledWith('RateLimit-Remaining', '42');
+      expect(response.setHeader).toHaveBeenCalledWith('RateLimit-Reset', '0');
+    });
+
     it('should apply custom decorator values to bucket capacity and refill duration', async () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           RateLimitGuard,
+          { provide: JwtService, useValue: new JwtService() },
           { provide: REDIS_CLIENT, useValue: mockRedis },
           { provide: Reflector, useValue: createReflector({ points: 10, duration: 5 }) },
         ],
@@ -306,10 +322,10 @@ describe('RateLimitGuard', () => {
       expect(mockRedis.rateLimitCheck).toHaveBeenCalledTimes(2);
       expect(mockRedis.rateLimitCheck).toHaveBeenNthCalledWith(
         2,
-        'ratelimit:{wallet:gabc123:get:_auth_challenge}:bucket',
-        'ratelimit:{wallet:gabc123:get:_auth_challenge}:lockout',
-        'ratelimit:{wallet:gabc123:get:_auth_challenge}:abuse',
-        100,
+        'ratelimit:{wallet:testnet:gabc123:get:_auth_challenge}:bucket',
+        'ratelimit:{wallet:testnet:gabc123:get:_auth_challenge}:lockout',
+        'ratelimit:{wallet:testnet:gabc123:get:_auth_challenge}:abuse',
+        300, // AUTHENTICATED tier (verified wallet present) — see RATE_TIER_CONFIGS
         60_000,
         120_000,
         expect.any(Number),
@@ -336,10 +352,10 @@ describe('RateLimitGuard', () => {
       expect(mockRedis.rateLimitCheck).toHaveBeenCalledTimes(2);
       expect(mockRedis.rateLimitCheck).toHaveBeenNthCalledWith(
         2,
-        'ratelimit:{wallet:gabc123:get:_auth_challenge}:bucket',
+        'ratelimit:{wallet:testnet:gabc123:get:_auth_challenge}:bucket',
         expect.any(String),
         expect.any(String),
-        100,
+        300, // AUTHENTICATED tier (verified wallet present) — see RATE_TIER_CONFIGS
         60_000,
         120_000,
         expect.any(Number),
@@ -397,7 +413,7 @@ describe('RateLimitGuard', () => {
           'ratelimit:{ip:127.0.0.1:get:_auth_challenge}:bucket',
           expect.any(String),
           expect.any(String),
-          100,
+          60, // ANONYMOUS tier (no verified wallet) — see RATE_TIER_CONFIGS
           60_000,
           120_000,
           expect.any(Number),
@@ -449,6 +465,11 @@ describe('RateLimitGuard', () => {
       expect(mockRedis.rateLimitCheck).toHaveBeenCalledTimes(1);
     });
 
+    it('keys wallet rate limits by network so testnet and mainnet do not share a quota (#937)', () => {
+      const keysTestnet = (guard as any).buildKeys('wallet', 'gwallet1', 'get:_auth_challenge');
+      expect(keysTestnet.bucket).toContain('ratelimit:{wallet:testnet:gwallet1:get:_auth_challenge}:bucket');
+    });
+
     it('should reject immediately while a lockout key exists', async () => {
       // The script itself short-circuits on an existing lockout key (PTTL check) before
       // touching the bucket — from JS's side this still surfaces as a single rejected call.
@@ -457,6 +478,62 @@ describe('RateLimitGuard', () => {
       const { context } = mockContext();
       await expect(guard.canActivate(context)).rejects.toThrow(HttpException);
       expect(mockRedis.rateLimitCheck).toHaveBeenCalledTimes(1);
+    });
+
+    // #369: 429s carry Retry-After / X-RateLimit-* and are logged + counted.
+    it('should set Retry-After and X-RateLimit-* headers, log and count a rejection', async () => {
+      const metrics = { increment: jest.fn() };
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RateLimitGuard,
+          { provide: JwtService, useValue: new JwtService() },
+          { provide: REDIS_CLIENT, useValue: mockRedis },
+          { provide: Reflector, useValue: createReflector() },
+          { provide: MetricsService, useValue: metrics },
+        ],
+      }).compile();
+      const metricGuard = module.get<RateLimitGuard>(RateLimitGuard);
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      mockRedis.queueResults([[null, [0, 12]]]);
+
+      const { context, response } = mockContext({ ip: '203.0.113.77' });
+      await expect(metricGuard.canActivate(context)).rejects.toThrow(HttpException);
+
+      expect(response.setHeader).toHaveBeenCalledWith('Retry-After', '12');
+      expect(response.setHeader).toHaveBeenCalledWith('X-RateLimit-Remaining', '0');
+      expect(response.setHeader).toHaveBeenCalledWith('X-RateLimit-Reset', '12');
+      expect(metrics.increment).toHaveBeenCalledWith('rate_limit_rejections_total', {
+        route: expect.stringContaining('auth'),
+        scope: 'ip',
+      });
+      const logged = warn.mock.calls.map(call => String(call[0])).join('\n');
+      expect(logged).toContain('Rate limit exceeded');
+      expect(logged).toContain('scope=ip');
+      expect(logged).not.toContain('203.0.113.77');
+    });
+
+    it('should resolve thunk-valued @RateLimit() limits (env-configured auth routes)', async () => {
+      const reflector = {
+        getAllAndOverride: jest.fn((key: string) => {
+          if (key === RATE_LIMIT_POINTS) return () => 3;
+          if (key === RATE_LIMIT_DURATION) return () => 60;
+          return undefined;
+        }),
+      };
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RateLimitGuard,
+          { provide: JwtService, useValue: new JwtService() },
+          { provide: REDIS_CLIENT, useValue: mockRedis },
+          { provide: Reflector, useValue: reflector },
+        ],
+      }).compile();
+      const thunkGuard = module.get<RateLimitGuard>(RateLimitGuard);
+      mockRedis.queueResults([[null, [1, 0]]]);
+
+      await expect(thunkGuard.canActivate(mockContext().context)).resolves.toBe(true);
+      expect(mockRedis.rateLimitCheck.mock.calls[0][3]).toBe(3);
+      expect(mockRedis.rateLimitCheck.mock.calls[0][4]).toBe(60_000);
     });
 
   });
@@ -470,6 +547,7 @@ describe('RateLimitGuard', () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           RateLimitGuard,
+          { provide: JwtService, useValue: new JwtService() },
           MetricsService,
           { provide: REDIS_CLIENT, useValue: mockRedis },
           { provide: Reflector, useValue: createReflector({ onRedisError }) },
@@ -569,6 +647,32 @@ describe('RateLimitGuard', () => {
       }
     });
 
+    it('hardcodes deny for auth routes during Redis outage regardless of global or route setting', async () => {
+      const openGuard = await makeGuard('allow');
+      mockRedis.failExec(new Error('connection lost'));
+
+      const authContext = mockContext({ routePath: '/auth/challenge' }).context;
+      await expect(openGuard.canActivate(authContext)).rejects.toMatchObject({
+        status: HttpStatus.SERVICE_UNAVAILABLE,
+      });
+    });
+
+    it('honors RATE_LIMIT_ON_REDIS_ERROR=deny on non-auth routes during Redis outage', async () => {
+      mockRedis.failExec(new Error('Redis connection refused'));
+      const settings = getConfig() as { RATE_LIMIT_ON_REDIS_ERROR: string };
+      const original = settings.RATE_LIMIT_ON_REDIS_ERROR;
+      settings.RATE_LIMIT_ON_REDIS_ERROR = 'deny';
+      try {
+        const guard = await makeGuard();
+        const escrowContext = mockContext({ routePath: '/escrows' }).context;
+        await expect(guard.canActivate(escrowContext)).rejects.toMatchObject({
+          status: HttpStatus.SERVICE_UNAVAILABLE,
+        });
+      } finally {
+        settings.RATE_LIMIT_ON_REDIS_ERROR = original;
+      }
+    });
+
     it('should log a sustained outage once per interval but count every failure', async () => {
       const openGuard = await makeGuard();
       mockRedis.failExec(new Error('connection lost'));
@@ -611,7 +715,14 @@ describe('RateLimitGuard', () => {
       await expect(closedGuard.canActivate(mockContext().context)).rejects.toMatchObject({
         status: HttpStatus.TOO_MANY_REQUESTS,
       });
-      expect(metrics.getAll()).toEqual([]);
+      // A genuine rejection records the normal rejection metric, never the outage one —
+      // Redis answered fine here, it just said "no".
+      expect(metrics.getAll()).not.toContainEqual(
+        expect.objectContaining({ name: 'rate_limit_redis_error_total' }),
+      );
+      expect(metrics.getAll()).toContainEqual(
+        expect.objectContaining({ name: 'rate_limit_rejections_total' }),
+      );
     });
   });
 });
@@ -627,6 +738,7 @@ describe('RateLimitGuard Supertest integration', () => {
       controllers: [RateLimitTestController],
       providers: [
         { provide: REDIS_CLIENT, useValue: mockRedis },
+        { provide: JwtService, useValue: new JwtService() },
         {
           provide: APP_GUARD,
           useClass: RateLimitGuard,
@@ -646,13 +758,13 @@ describe('RateLimitGuard Supertest integration', () => {
   it('should allow HTTP requests while shared Redis bucket allows them', async () => {
     mockRedis.queueResults([[null, [1, 0]]]);
 
-    await request(app.getHttpServer()).get('/v1/rate-limit-test/limited').expect(200, { ok: true });
+    await request(app.getHttpServer()).get('/rate-limit-test/limited').expect(200, { ok: true });
   });
 
   it('should return 429 with retry details when shared Redis bucket rejects', async () => {
     mockRedis.queueResults([[null, [0, 7]]]);
 
-    const response = await request(app.getHttpServer()).get('/v1/rate-limit-test/limited').expect(429);
+    const response = await request(app.getHttpServer()).get('/rate-limit-test/limited').expect(429);
 
     expect(response.body).toMatchObject({
       statusCode: 429,
@@ -670,7 +782,7 @@ describe('RateLimitGuard Supertest integration', () => {
 
     const token = signToken({ address: 'GABC123', sub: 'GABC123' });
     await request(app.getHttpServer())
-      .post('/v1/rate-limit-test/wallet')
+      .post('/rate-limit-test/wallet')
       .set('Authorization', `Bearer ${token}`)
       .send({})
       .expect(201, { ok: true });
@@ -678,10 +790,10 @@ describe('RateLimitGuard Supertest integration', () => {
     expect(mockRedis.rateLimitCheck).toHaveBeenCalledTimes(2);
     expect(mockRedis.rateLimitCheck).toHaveBeenNthCalledWith(
       2,
-      expect.stringContaining('ratelimit:{wallet:gabc123'),
+      expect.stringContaining('ratelimit:{wallet:testnet:gabc123'),
       expect.any(String),
       expect.any(String),
-      100,
+      300, // AUTHENTICATED tier (verified wallet present) — see RATE_TIER_CONFIGS
       60_000,
       120_000,
       expect.any(Number),
@@ -695,13 +807,13 @@ describe('RateLimitGuard Supertest integration', () => {
   it('should not create a new wallet-scoped bucket when a client rotates an unverified walletAddress in the request body', async () => {
     mockRedis.queueResults([[null, [1, 0]]]);
     await request(app.getHttpServer())
-      .post('/v1/rate-limit-test/wallet')
+      .post('/rate-limit-test/wallet')
       .send({ walletAddress: 'ROTATED-1' })
       .expect(201, { ok: true });
 
     mockRedis.queueResults([[null, [1, 0]]]);
     await request(app.getHttpServer())
-      .post('/v1/rate-limit-test/wallet')
+      .post('/rate-limit-test/wallet')
       .send({ walletAddress: 'ROTATED-2' })
       .expect(201, { ok: true });
 
@@ -713,7 +825,7 @@ describe('RateLimitGuard Supertest integration', () => {
       expect.stringContaining('ratelimit:{ip:'),
       expect.any(String),
       expect.any(String),
-      100,
+      60, // ANONYMOUS tier (no verified wallet) — see RATE_TIER_CONFIGS
       60_000,
       120_000,
       expect.any(Number),
@@ -727,7 +839,7 @@ describe('RateLimitGuard Supertest integration', () => {
       expect.stringContaining('ratelimit:{ip:'),
       expect.any(String),
       expect.any(String),
-      100,
+      60, // ANONYMOUS tier (no verified wallet) — see RATE_TIER_CONFIGS
       60_000,
       120_000,
       expect.any(Number),
@@ -736,5 +848,67 @@ describe('RateLimitGuard Supertest integration', () => {
       expect.any(Number),
       expect.any(String),
     );
+  });
+});
+
+/**
+ * #369 — repeated GET /auth/challenge from one IP is rejected once the configured auth limit
+ * is used up, independently of the global default. The Redis bucket is simulated in memory.
+ */
+describe('Auth challenge rate limit (#369)', () => {
+  const LIMIT = 3;
+  let app: INestApplication;
+
+  @Controller('auth')
+  class FakeAuthController {
+    @Get('challenge')
+    @RateLimit(() => LIMIT, () => 60)
+    challenge() {
+      return { challenge: 'x' };
+    }
+  }
+
+  function countingRedis() {
+    const used = new Map<string, number>();
+    const queued: string[] = [];
+    const pipelineObj = {
+      rateLimitCheck: (bucket: string, _l: string, _a: string, points: number) => {
+        const count = (used.get(bucket) ?? 0) + 1;
+        used.set(bucket, count);
+        queued.push(count <= points ? 'allow' : 'deny');
+        return pipelineObj;
+      },
+      exec: jest.fn(async () =>
+        queued.splice(0).map(result => [null, result === 'allow' ? [1, 0] : [0, 42]]),
+      ),
+    };
+    return { defineCommand: jest.fn(), pipeline: () => pipelineObj };
+  }
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({
+      controllers: [FakeAuthController],
+      providers: [
+        Reflector,
+        { provide: JwtService, useValue: jwtService },
+        { provide: REDIS_CLIENT, useValue: countingRedis() },
+        { provide: APP_GUARD, useClass: RateLimitGuard },
+      ],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('returns 429 with Retry-After after the configured number of challenges', async () => {
+    for (let i = 0; i < LIMIT; i++) {
+      await request(app.getHttpServer()).get('/auth/challenge').expect(200);
+    }
+    const res = await request(app.getHttpServer()).get('/auth/challenge').expect(429);
+    expect(res.headers['retry-after']).toBe('42');
+    expect(res.body.retryAfter).toBe(42);
   });
 });

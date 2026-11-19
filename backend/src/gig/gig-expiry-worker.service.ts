@@ -5,8 +5,13 @@ import { DEFAULT_GIG_EXPIRY_SWEEP_INTERVAL_MS } from './gig.entity';
 import { DistributedLockService } from '../common/redis/distributed-lock.service';
 import { mapWithConcurrency, countRejected } from '../common/concurrency';
 import { config } from '../config/env.config';
+import { MetricsService } from '../monitoring/metrics.service';
+import { SentryService } from '../sentry/sentry.service';
+import { EscrowService } from '../escrow/escrow.service';
+import { Optional } from '@nestjs/common';
 
 const LOCK_KEY = 'lock:gig-expiry-sweep';
+const LOCK_RENEWAL_INTERVAL_MS = 10_000;
 
 /**
  * Periodically sweeps the DB for open gig solicitations whose response deadline has
@@ -42,6 +47,7 @@ export class GigExpiryWorkerService implements OnModuleInit, OnModuleDestroy {
     private readonly lock: DistributedLockService,
     private readonly metrics: MetricsService,
     private readonly sentry: SentryService,
+    @Optional() private readonly escrowService?: EscrowService,
   ) {}
 
   onModuleInit(): void {
@@ -134,20 +140,58 @@ export class GigExpiryWorkerService implements OnModuleInit, OnModuleDestroy {
    * Exposed so it can be triggered manually (e.g. from tests or an admin endpoint).
    */
   async runOnce(): Promise<void> {
-    const expirable = await this.gigService.findExpirable();
+    const startMs = Date.now();
+    let expirable = await this.gigService.findExpirable();
+
+    // Apply the max gigs per sweep cap if configured (#790)
+    const maxGigs = this.getMaxGigsPerSweep();
+    if (maxGigs !== undefined && expirable.length > maxGigs) {
+      this.logger.debug(
+        `Capping gig expiry sweep to ${maxGigs} gigs (${expirable.length} expirable)`,
+      );
+      expirable = expirable.slice(0, maxGigs);
+    }
 
     // Expire gigs with bounded concurrency instead of one-at-a-time: each
     // `expire()` appends an outbox row the relay then delivers with retries,
     // so a fully sequential loop over a big batch serialised all of that
     // latency and could outrun the sweep interval (#236). A failed `expire`
     // no longer aborts the rest of the sweep — it is counted and logged.
-    const results = await mapWithConcurrency(expirable, config.GIG_EXPIRY_SWEEP_CONCURRENCY, gig =>
+    const concurrency = this.getSweepConcurrency();
+    const results = await mapWithConcurrency(expirable, concurrency, gig =>
       this.gigService.expire(gig.id),
     );
     const failed = countRejected(results);
+    const succeeded = expirable.length - failed;
+
+    const durationMs = Date.now() - startMs;
+    this.metrics.increment('gig_expiry_sweep_duration_ms', { status: 'success' });
+    this.metrics.increment('gig_expiry_sweep_gigs_expired_total', {}, succeeded);
+    this.metrics.increment('gig_expiry_sweep_gigs_failed_total', {}, failed);
+
     if (failed > 0) {
       this.logger.warn(`Gig expiry sweep: ${failed}/${expirable.length} gigs failed to expire`);
+      // Capture per-gig failures to Sentry for diagnosis
+      const failedGigs = results
+        .map((r, i) => ({ result: r, gig: expirable[i] }))
+        .filter(({ result }) => result.status === 'rejected')
+        .map(({ result, gig }) => ({
+          id: gig.id,
+          error: (result as PromiseRejectedResult).reason?.message ?? String((result as PromiseRejectedResult).reason),
+        }));
+      const batchError = new Error(
+        `Gig expiry sweep: ${failed} gigs failed`,
+      ) as Error & { failedGigs?: Array<{ id: string; error: string }> };
+      batchError.failedGigs = failedGigs;
+      this.sentry.captureException(batchError, GigExpiryWorkerService.name);
+      this.failedBatchCount++;
+    } else {
+      this.failedBatchCount = 0;
     }
+
+    this.logger.log(
+      `Gig expiry sweep completed in ${durationMs}ms — ${succeeded} expired, ${failed} failed`,
+    );
   }
 
   private getSweepConcurrency(): number {

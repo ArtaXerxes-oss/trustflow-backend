@@ -45,6 +45,28 @@ export const MAX_BASE64_CONTENT_LENGTH = 14_316_560;
 
 export const DEFAULT_REPLICATION_FACTOR = 2;
 export const DEFAULT_REPIN_INTERVAL_MS = 5 * 60 * 1000;
+/**
+ * Longer than `DEFAULT_REPIN_INTERVAL_MS` because this probe does a real pin/unpin round
+ * trip against every provider (not just a re-verify of existing pins), so it needs a wider
+ * interval to avoid needlessly churning provider API quotas.
+ */
+export const DEFAULT_PROVIDER_HEALTH_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+
+/**
+ * How many of the *registered* providers (not just `replicationFactor`) actually hold the
+ * pin (#992). `status` alone only promises `replicationFactor`-level durability — a caller
+ * that configured three providers for redundancy but only required `replicationFactor: 2`
+ * cannot tell from `status: HEALTHY` alone whether the third provider ended up holding the
+ * content too, or silently failed.
+ * - `full`: every registered provider successfully holds the pin.
+ * - `partial`: at least one, but not every, registered provider holds it.
+ * - `none`: no registered provider holds it.
+ */
+export enum PinRedundancy {
+  FULL = 'full',
+  PARTIAL = 'partial',
+  NONE = 'none',
+}
 
 export interface ProviderPinRecord {
   provider: PinProviderName;
@@ -61,6 +83,8 @@ export interface PinRecord {
   filename?: string;
   replicationFactor: number;
   status: PinStatus;
+  /** See {@link PinRedundancy}. Reflects every registered provider, not just `replicationFactor`. */
+  redundancy: PinRedundancy;
   providers: ProviderPinRecord[];
   createdAt: string;
   updatedAt: string;

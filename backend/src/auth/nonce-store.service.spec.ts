@@ -18,6 +18,9 @@ describe('NonceStoreService', () => {
       del: jest.fn(),
       exists: jest.fn(),
       eval: jest.fn(),
+      incr: jest.fn(),
+      expire: jest.fn(),
+      ttl: jest.fn(),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -66,18 +69,32 @@ describe('NonceStoreService', () => {
         expect(await service.isNonceReplay(TEST_NONCE)).toBe(false);
       });
 
-      it('should replace existing challenge if NX fails', async () => {
-        mockRedis.set.mockResolvedValueOnce(null).mockResolvedValueOnce('OK');
+      // #369: a live challenge must not be replaced, or anyone could cancel another
+      // wallet's pending login by requesting a new challenge for its address.
+      it('should keep and return the existing live challenge if NX fails', async () => {
+        mockRedis.set.mockResolvedValueOnce(null);
+        mockRedis.get.mockResolvedValueOnce(TEST_CHALLENGE);
 
-        await service.store(TEST_ADDRESS, TEST_CHALLENGE, TEST_NONCE);
+        const active = await service.store(TEST_ADDRESS, 'attacker challenge', 'other-nonce');
 
-        expect(mockRedis.set).toHaveBeenCalledTimes(2);
-        expect(mockRedis.set).toHaveBeenCalledWith(
+        expect(active).toBe(TEST_CHALLENGE);
+        expect(mockRedis.set).toHaveBeenCalledTimes(1);
+        expect(mockRedis.set).not.toHaveBeenCalledWith(
           `auth:nonce:${TEST_ADDRESS}`,
-          TEST_CHALLENGE,
+          'attacker challenge',
           'EX',
           60,
         );
+      });
+
+      it('should claim the slot again if the existing challenge expired in between', async () => {
+        mockRedis.set.mockResolvedValueOnce(null).mockResolvedValueOnce('OK');
+        mockRedis.get.mockResolvedValueOnce(null);
+
+        const active = await service.store(TEST_ADDRESS, TEST_CHALLENGE, TEST_NONCE);
+
+        expect(active).toBe(TEST_CHALLENGE);
+        expect(mockRedis.set).toHaveBeenCalledTimes(2);
       });
 
       it('should fallback to memory when Redis fails', async () => {
@@ -186,6 +203,47 @@ describe('NonceStoreService', () => {
         expect(result).toBe(false);
       });
     });
+
+    // #993: per-wallet counter on /auth/challenge, independent of IP.
+    describe('checkWalletChallengeRateLimit', () => {
+      it('allows requests under the limit and does not re-set the TTL after the first call', async () => {
+        mockRedis.incr.mockResolvedValue(3);
+
+        const result = await service.checkWalletChallengeRateLimit(TEST_ADDRESS, 5, 300);
+
+        expect(result).toEqual({ allowed: true, retryAfter: 0 });
+        expect(mockRedis.expire).not.toHaveBeenCalled();
+      });
+
+      it('sets the window TTL only on the first request in the window', async () => {
+        mockRedis.incr.mockResolvedValue(1);
+
+        await service.checkWalletChallengeRateLimit(TEST_ADDRESS, 5, 300);
+
+        expect(mockRedis.expire).toHaveBeenCalledWith(
+          `auth:challenge:wallet-ratelimit:${TEST_ADDRESS}`,
+          300,
+        );
+      });
+
+      it('rejects once the per-wallet count exceeds the configured points', async () => {
+        mockRedis.incr.mockResolvedValue(6);
+        mockRedis.ttl.mockResolvedValue(120);
+
+        const result = await service.checkWalletChallengeRateLimit(TEST_ADDRESS, 5, 300);
+
+        expect(result).toEqual({ allowed: false, retryAfter: 120 });
+      });
+
+      it('falls back to the full window duration when Redis TTL is unavailable', async () => {
+        mockRedis.incr.mockResolvedValue(6);
+        mockRedis.ttl.mockResolvedValue(-1);
+
+        const result = await service.checkWalletChallengeRateLimit(TEST_ADDRESS, 5, 300);
+
+        expect(result).toEqual({ allowed: false, retryAfter: 300 });
+      });
+    });
   });
 
   describe('without Redis (fallback to memory)', () => {
@@ -264,6 +322,78 @@ describe('NonceStoreService', () => {
 
       const result = await memoryService.consume(TEST_ADDRESS);
       expect(result).toBeNull();
+    });
+
+    // #993: same fixed-window behaviour as the Redis path, for single-node/dev deployments.
+    describe('checkWalletChallengeRateLimit', () => {
+      it('allows up to the configured number of requests, then rejects', async () => {
+        for (let i = 0; i < 5; i++) {
+          expect(await memoryService.checkWalletChallengeRateLimit(TEST_ADDRESS, 5, 300)).toEqual({
+            allowed: true,
+            retryAfter: 0,
+          });
+        }
+
+        const result = await memoryService.checkWalletChallengeRateLimit(TEST_ADDRESS, 5, 300);
+        expect(result.allowed).toBe(false);
+        expect(result.retryAfter).toBeGreaterThan(0);
+      });
+
+      it('tracks separate windows per wallet address', async () => {
+        for (let i = 0; i < 5; i++) {
+          await memoryService.checkWalletChallengeRateLimit(TEST_ADDRESS, 5, 300);
+        }
+        const otherAddress = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
+
+        const result = await memoryService.checkWalletChallengeRateLimit(otherAddress, 5, 300);
+
+        expect(result).toEqual({ allowed: true, retryAfter: 0 });
+      });
+
+      it('resets the window once it expires', async () => {
+        const key = 'auth:challenge:wallet-ratelimit:' + TEST_ADDRESS;
+        for (let i = 0; i < 5; i++) {
+          await memoryService.checkWalletChallengeRateLimit(TEST_ADDRESS, 5, 300);
+        }
+        (memoryService as any).inMemoryWalletChallengeCounts.set(key, {
+          count: 5,
+          resetAt: Date.now() - 1000,
+        });
+
+        const result = await memoryService.checkWalletChallengeRateLimit(TEST_ADDRESS, 5, 300);
+
+        expect(result).toEqual({ allowed: true, retryAfter: 0 });
+      });
+    });
+  });
+
+  describe('pending-challenge protection without Redis (#369)', () => {
+    it('does not let a second request replace a live challenge', async () => {
+      const memoryService = new NonceStoreService(null);
+      const first = await memoryService.store(TEST_ADDRESS, TEST_CHALLENGE, TEST_NONCE);
+      const second = await memoryService.store(TEST_ADDRESS, 'attacker challenge', 'n2');
+
+      expect(first).toBe(TEST_CHALLENGE);
+      expect(second).toBe(TEST_CHALLENGE);
+      expect(await memoryService.consume(TEST_ADDRESS)).toBe(TEST_CHALLENGE);
+    });
+  });
+  describe('atomic TTL enforcement (#908)', () => {
+    it('executes INCR_WITH_EXPIRE_LUA to set TTL atomically with key increment', async () => {
+      const mockRedis = {
+        eval: jest.fn().mockResolvedValue(1),
+        ttl: jest.fn().mockResolvedValue(60),
+      };
+      const serviceWithRedis = new NonceStoreService(mockRedis as any);
+      const res = await serviceWithRedis.checkWalletChallengeRateLimit('G123', 5, 60);
+
+      expect(res.allowed).toBe(true);
+      expect(mockRedis.eval).toHaveBeenCalledWith(
+        expect.stringContaining('INCR'),
+        1,
+        'auth:challenge:wallet-ratelimit:G123',
+        60,
+      );
     });
   });
 });

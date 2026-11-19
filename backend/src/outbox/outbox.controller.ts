@@ -1,60 +1,94 @@
-import {
-  Controller,
-  Get,
-  HttpCode,
-  HttpStatus,
-  NotFoundException,
-  Param,
-  Post,
-  UseGuards,
-} from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
-import { JwtAuthGuard } from '../auth/auth.guard';
-import { AdminGuard } from '../admin/admin.guard';
-import { OutboxRelayService } from './outbox-relay.service';
+import { Controller, Get, Post, Body, Param, UseGuards } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBody, ApiBearerAuth } from '@nestjs/swagger';
 import { OutboxService } from './outbox.service';
+import { OutboxEventState, OutboxEventType } from './outbox.entity';
+import { CreateOutboxEventSchema } from './outbox.dto';
+import { JwtAuthGuard } from '../auth/auth.guard';
 
 @ApiTags('Outbox')
-@ApiBearerAuth()
-@UseGuards(JwtAuthGuard, AdminGuard)
-@Controller('outbox')
+@ApiBearerAuth('JWT-auth')
+@Controller()
+@UseGuards(JwtAuthGuard)
 export class OutboxController {
-  constructor(
-    private readonly outbox: OutboxService,
-    private readonly relay: OutboxRelayService,
-  ) {}
+  constructor(private readonly outboxService: OutboxService) {}
 
-  @Get(':id')
+  @Get('admin/outbox/events')
   @ApiOperation({
-    summary: 'Inspect a durable domain event (admin only)',
-    description: 'Returns event delivery state, including its consumer-facing deduplication key.',
+    summary: 'List all outbox events',
+    description: 'Returns all outbox events, optionally filtered by state.',
   })
-  @ApiParam({ name: 'id', description: 'Outbox event UUID' })
-  @ApiResponse({ status: 200, description: 'Outbox event found' })
-  @ApiResponse({ status: 401, description: 'Unauthorized — valid JWT required' })
-  @ApiResponse({ status: 403, description: 'Forbidden — admin privileges required' })
-  @ApiResponse({ status: 404, description: 'Outbox event not found' })
-  async findOne(@Param('id') id: string) {
-    const event = await this.outbox.findById(id);
-    if (!event) throw new NotFoundException(`Outbox event ${id} not found`);
+  @ApiResponse({ status: 200, description: 'List of outbox events' })
+  async getEvents() {
+    return this.outboxService.getEvents();
+  }
+
+  @Get('admin/outbox/events/:id')
+  @ApiOperation({
+    summary: 'Get outbox event by ID',
+    description: 'Returns a single outbox event with its current state and attempt count.',
+  })
+  @ApiParam({ name: 'id', description: 'Outbox event ID' })
+  @ApiResponse({ status: 200, description: 'Outbox event details' })
+  async getEvent(@Param('id') id: string) {
+    const event = await this.outboxService.getEvent(id);
+    if (!event) return { error: 'Event not found' };
     return event;
   }
 
-  @Post('relay')
-  @HttpCode(HttpStatus.ACCEPTED)
+  @Post('admin/outbox/events')
   @ApiOperation({
-    summary: 'Run one outbox relay batch (admin only)',
+    summary: 'Create outbox event',
+    description: 'Creates a new outbox event for asynchronous processing.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['eventType', 'payload'],
+      properties: {
+        eventType: {
+          type: 'string',
+          enum: ['ESCROW_CREATED', 'ESCROW_RELEASED', 'DISPUTE_RAISED', 'DISPUTE_RESOLVED', 'EVIDENCE_SUBMITTED', 'MILESTONE_APPROVED'],
+        },
+        payload: { type: 'string', description: 'JSON string payload' },
+      },
+    },
+  })
+  @ApiResponse({ status: 201, description: 'Outbox event created' })
+  async createEvent(@Body() body: typeof CreateOutboxEventSchema._type) {
+    return this.outboxService.createEvent(body.eventType as OutboxEventType, body.payload);
+  }
+
+  @Post('admin/outbox/replay/:id')
+  @ApiOperation({
+    summary: 'Replay a dead-lettered event',
+    description: 'Resets and re-processes a dead-lettered outbox event.',
+  })
+  @ApiParam({ name: 'id', description: 'Outbox event ID to replay' })
+  @ApiResponse({ status: 200, description: 'Replay result with success status' })
+  async replayEvent(@Param('id') id: string) {
+    return this.outboxService.replayEvent(id);
+  }
+
+  @Post('admin/outbox/replay-all')
+  @ApiOperation({
+    summary: 'Replay all dead-lettered events',
+    description: 'Re-processes all events currently in the dead letter queue.',
+  })
+  @ApiResponse({ status: 200, description: 'Breakdown of succeeded and failed replays' })
+  async replayAll() {
+    return this.outboxService.replayAll();
+  }
+
+  @Post('admin/outbox/cleanup')
+  @ApiOperation({
+    summary: 'Purge delivered outbox messages past their retention window',
     description:
-      'Operational endpoint for draining due events without waiting for the scheduled relay.',
+      'Removes delivered events whose deliveredAt is older than the configured retention ' +
+      '(measured from delivery time, not creation time). Returns the number purged.',
   })
-  @ApiResponse({
-    status: 202,
-    description: 'Relay batch processed',
-    schema: { example: { processed: 3 } },
-  })
-  @ApiResponse({ status: 401, description: 'Unauthorized — valid JWT required' })
-  @ApiResponse({ status: 403, description: 'Forbidden — admin privileges required' })
-  async relayNow() {
-    return { processed: await this.relay.runOnce() };
+  @ApiResponse({ status: 200, description: 'Number of events purged' })
+  async cleanup() {
+    const purged = await this.outboxService.purgeDeliveredOutboxMessages();
+    return { purged };
   }
 }

@@ -1,290 +1,563 @@
-import { Inject, Injectable, OnModuleInit, Optional } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { SanitizedLogger } from '../common/logging/sanitized-logger';
-import { randomUUID } from 'crypto';
+import { CorrelationIdStore } from '../common/logging/correlation-id.store';
+import { requestContextStorage } from '../common/logging/request-context';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { MetricsService } from '../monitoring/metrics.service';
-import { OutboxEvent, OutboxTransaction } from './outbox.types';
 import { config } from '../config/env.config';
+import { OutboxEvent, OutboxTransaction } from './outbox.types';
+import { OutboxEventState, OutboxEventType, OutboxEvent as LegacyOutboxEvent } from './outbox.entity';
+import { randomUUID } from 'crypto';
 
-const EVENT_KEY_PREFIX = 'outbox:event:';
+// ─── Redis key constants ───────────────────────────────────────────────────────
 const PENDING_KEY = 'outbox:pending';
 const PROCESSING_KEY = 'outbox:processing';
-const WEBHOOK_PENDING_KEY = 'outbox:webhook:pending';
-const WEBHOOK_PROCESSING_KEY = 'outbox:webhook:processing';
-export const DEFAULT_OUTBOX_DELIVERED_TTL_SECONDS = 7 * 24 * 60 * 60;
-export const DEFAULT_OUTBOX_MAX_ATTEMPTS = 5;
-const CLAIM_DUE_SCRIPT = `
-  local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[3])
-  local claimed = {}
-  for _, id in ipairs(ids) do
-    if redis.call('ZREM', KEYS[1], id) == 1 then
-      redis.call('ZADD', KEYS[2], ARGV[2], id)
-      table.insert(claimed, id)
-    end
-  end
-  return claimed
-`;
-const RECLAIM_EXPIRED_SCRIPT = `
-  local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
-  for _, id in ipairs(ids) do
-    if redis.call('ZREM', KEYS[1], id) == 1 then
-      redis.call('ZADD', KEYS[2], ARGV[1], id)
-    end
-  end
-  return ids
-`;
+const EVENT_KEY_PREFIX = 'outbox:event:';
 
-export const OUTBOX_PERSISTENCE_FALLBACK_METRIC = 'outbox_persistence_fallback_total';
+// ─── Lua scripts ──────────────────────────────────────────────────────────────
 
 /**
- * Redis-backed transactional outbox store.
+ * Atomically claims up to `count` events whose score (= nextAttemptAt) ≤ `now`.
  *
- * The current backend persists aggregate state in Redis, not PostgreSQL. The
- * caller appends an outbox event to the exact same MULTI/EXEC transaction as
- * the aggregate change; production refuses to start without Redis. This keeps
- * the outbox durable and atomic with the actual domain store today while
- * preserving a narrow API for a future SQL repository implementation.
+ * KEYS[1] = pending sorted set
+ * KEYS[2] = processing sorted set
+ * ARGV[1] = now (ms)
+ * ARGV[2] = lease expiry (ms) = now + leaseMs
+ * ARGV[3] = count
+ *
+ * Returns the list of claimed event IDs.
  */
+const CLAIM_DUE_SCRIPT = `
+local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[3]))
+for _, id in ipairs(members) do
+  redis.call('ZREM', KEYS[1], id)
+  redis.call('ZADD', KEYS[2], ARGV[2], id)
+end
+return members
+`;
+
+/**
+ * Moves all processing entries whose lease has expired back to pending.
+ *
+ * KEYS[1] = processing sorted set
+ * KEYS[2] = pending sorted set
+ * ARGV[1] = now (ms) — entries with score < now are expired
+ * ARGV[2] = count cap
+ *
+ * Returns the list of reclaimed IDs.
+ */
+const RECLAIM_EXPIRED_SCRIPT = `
+local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+for _, id in ipairs(expired) do
+  redis.call('ZREM', KEYS[1], id)
+  redis.call('ZADD', KEYS[2], ARGV[1], id)
+end
+return expired
+`;
+
+// ─── Service ──────────────────────────────────────────────────────────────────
+
 @Injectable()
-export class OutboxService implements OnModuleInit {
+export class OutboxService {
   private readonly logger = new SanitizedLogger(OutboxService.name);
+
+  // ── In-memory fallback (used when Redis is null) ──
   private readonly memory = new Map<string, OutboxEvent>();
   private readonly pending = new Set<string>();
+  // Maps a claimed event id to its lease expiry (ms epoch), mirroring the Redis path's
+  // `outbox:processing` sorted-set score. Without this, a consumer that claims a batch and
+  // then crashes before dispatching leaves those ids with no recorded expiry at all, so
+  // nothing can ever tell a crashed claim apart from one that's still being worked — see #976.
   private readonly processing = new Map<string, number>();
-  private readonly webhookPending = new Set<string>();
-  private readonly webhookProcessing = new Map<string, number>();
+
+  // ── Legacy in-memory store (for createEvent/processEvent/replayEvent) ──
+  private readonly legacyEvents = new Map<string, LegacyOutboxEvent>();
+  private readonly legacyMaxAttempts = 10;
 
   constructor(
-    @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
+    @Optional() @Inject(REDIS_CLIENT) private readonly redis: Redis | null = null,
     @Optional() private readonly metrics?: MetricsService,
+    @Optional() private readonly correlationIdStore?: CorrelationIdStore,
   ) {}
 
-  onModuleInit(): void {
-    if (!this.redis && config.NODE_ENV === 'production') {
-      throw new Error(
-        'OutboxService requires REDIS_URL in production so domain state and outbox events share a durable transaction',
-      );
-    }
-  }
+  // ══════════════════════════════════════════════════════════════════════════
+  // Core Redis-backed API
+  // ══════════════════════════════════════════════════════════════════════════
 
-  create<T>(type: string, aggregateType: string, aggregateId: string, payload: T): OutboxEvent<T> {
-    const now = Date.now();
+  /**
+   * Builds a new OutboxEvent but does NOT persist it yet — callers must follow
+   * up with `append()` or `appendToTransaction()`.
+   */
+  create(
+    type: string,
+    aggregateType: string,
+    aggregateId: string,
+    payload: unknown,
+    correlationId?: string,
+  ): OutboxEvent {
+    const resolvedCorrelationId =
+      correlationId ??
+      this.correlationIdStore?.get() ??
+      requestContextStorage.getStore()?.requestId;
+
     return {
       id: randomUUID(),
-      dedupKey: `${aggregateType}:${aggregateId}:${type}`,
+      dedupKey: `${type}:${aggregateType}:${aggregateId}:${Date.now()}`,
       type,
       aggregateType,
       aggregateId,
       payload,
       status: 'pending',
       attempts: 0,
-      nextAttemptAt: now,
-      createdAt: new Date(now).toISOString(),
+      nextAttemptAt: Date.now(),
+      createdAt: new Date().toISOString(),
+      correlationId: resolvedCorrelationId,
     };
   }
 
-  /** Queues an event on the caller's already-open aggregate transaction. */
+  /** Persists an event created with `create()`. */
+  async append(event: OutboxEvent): Promise<void> {
+    if (this.redis) {
+      const results = await this.redis
+        .multi()
+        .set(this.eventKey(event.id), JSON.stringify(event))
+        .zadd(PENDING_KEY, event.nextAttemptAt, event.id)
+        .exec();
+      this.assertTransactionOk(results);
+      return;
+    }
+    this.memory.set(event.id, event);
+    this.pending.add(event.id);
+  }
+
+  /**
+   * Writes the event body and enqueues it in the pending sorted set as part of
+   * an existing Redis MULTI transaction.  Callers are responsible for calling
+   * `.exec()` and checking the result.
+   */
   appendToTransaction(transaction: OutboxTransaction, event: OutboxEvent): void {
     transaction
       .set(this.eventKey(event.id), JSON.stringify(event))
       .zadd(PENDING_KEY, event.nextAttemptAt, event.id);
   }
 
-  /** Fallback-only append for development/test stores that have no transaction. */
-  async append(event: OutboxEvent, isWebhook = false): Promise<void> {
-    const pendingKey = isWebhook ? WEBHOOK_PENDING_KEY : PENDING_KEY;
-    if (this.redis) {
-      const results = await this.redis
-        .multi()
-        .set(this.eventKey(event.id), JSON.stringify(event))
-        .zadd(pendingKey, event.nextAttemptAt, event.id)
-        .exec();
-      this.assertTransactionOk(results);
-      return;
-    }
-
-    this.logFallback('append');
-    this.memory.set(event.id, event);
-    if (isWebhook) this.webhookPending.add(event.id);
-    else this.pending.add(event.id);
-  }
-
-  sendWebhook(
-    transaction: OutboxTransaction | null,
-    eventName: string,
-    payload: unknown,
-    dedupKey?: string,
-  ): void {
-    const event = this.create(eventName, 'webhook', 'dispatch', payload);
-    if (dedupKey) event.dedupKey = dedupKey;
-    if (transaction) {
-      transaction
-        .set(this.eventKey(event.id), JSON.stringify(event))
-        .zadd(WEBHOOK_PENDING_KEY, event.nextAttemptAt, event.id);
-    } else {
-      this.append(event, true).catch(err => this.logger.error('Failed to append webhook', err));
-    }
-  }
-
-  async findById(id: string): Promise<OutboxEvent | undefined> {
-    if (this.redis) {
-      const raw = await this.redis.get(this.eventKey(id));
-      return raw ? (JSON.parse(raw) as OutboxEvent) : undefined;
-    }
-    return this.memory.get(id);
-  }
-
-  /** Atomically claims due events and places a lease on each one. */
+  /**
+   * Claims up to `batchSize` events whose `nextAttemptAt` ≤ `now`, atomically
+   * moving them from the pending set to the processing set with a lease expiry
+   * of `now + leaseMs`.
+   *
+   * The `isWebhook` parameter is accepted for API compatibility with callers
+   * that pass it, but the outbox uses a single key namespace for both kinds.
+   */
   async claimDue(
     now: number,
     leaseMs: number,
-    limit: number,
-    isWebhook = false,
+    batchSize: number,
+    _isWebhook = false,
   ): Promise<OutboxEvent[]> {
-    const pendingKey = isWebhook ? WEBHOOK_PENDING_KEY : PENDING_KEY;
-    const processingKey = isWebhook ? WEBHOOK_PROCESSING_KEY : PROCESSING_KEY;
     if (this.redis) {
       const ids = (await this.redis.eval(
         CLAIM_DUE_SCRIPT,
         2,
-        pendingKey,
-        processingKey,
-        now,
-        now + leaseMs,
-        limit,
+        PENDING_KEY,
+        PROCESSING_KEY,
+        String(now),
+        String(now + leaseMs),
+        String(batchSize),
       )) as string[];
-      if (ids.length === 0) return [];
-      const raw = await this.redis.mget(...ids.map(id => this.eventKey(id)));
-      return raw
-        .filter((entry): entry is string => entry !== null)
-        .map(entry => {
-          const event = JSON.parse(entry) as OutboxEvent;
-          event.status = 'processing';
-          return event;
-        });
+
+      return this.loadEvents(ids);
     }
 
-    this.logFallback('claim');
-    const pendingSet = isWebhook ? this.webhookPending : this.pending;
-    const processingMap = isWebhook ? this.webhookProcessing : this.processing;
-    const events = [...pendingSet]
-      .map(id => this.memory.get(id))
-      .filter((event): event is OutboxEvent => Boolean(event && event.nextAttemptAt <= now))
-      .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt)
-      .slice(0, limit);
-    for (const event of events) {
-      pendingSet.delete(event.id);
-      processingMap.set(event.id, now + leaseMs);
-      event.status = 'processing';
-    }
-    return events;
-  }
-
-  /** Returns abandoned processing leases to the pending set for redelivery. */
-  async reclaimExpired(now: number, limit: number, isWebhook = false): Promise<void> {
-    const pendingKey = isWebhook ? WEBHOOK_PENDING_KEY : PENDING_KEY;
-    const processingKey = isWebhook ? WEBHOOK_PROCESSING_KEY : PROCESSING_KEY;
-    if (this.redis) {
-      await this.redis.eval(RECLAIM_EXPIRED_SCRIPT, 2, processingKey, pendingKey, now, limit);
-      return;
-    }
-
-    const processingMap = isWebhook ? this.webhookProcessing : this.processing;
-    const pendingSet = isWebhook ? this.webhookPending : this.pending;
-    for (const [id, leaseUntil] of processingMap) {
-      if (leaseUntil > now) continue;
-      processingMap.delete(id);
+    // In-memory fallback: claim up to batchSize IDs whose nextAttemptAt ≤ now
+    const claimed: OutboxEvent[] = [];
+    for (const id of this.pending) {
+      if (claimed.length >= batchSize) break;
       const event = this.memory.get(id);
-      if (!event) continue;
-      event.status = 'pending';
-      event.nextAttemptAt = now;
-      pendingSet.add(id);
+      if (event && event.nextAttemptAt <= now) {
+        this.pending.delete(id);
+        this.processing.set(id, now + leaseMs);
+        claimed.push(event);
+      }
     }
+    return claimed;
   }
 
-  async markDelivered(event: OutboxEvent, isWebhook = false): Promise<void> {
-    const processingKey = isWebhook ? WEBHOOK_PROCESSING_KEY : PROCESSING_KEY;
-    event.status = 'delivered';
-    event.deliveredAt = new Date().toISOString();
-    event.lastError = undefined;
+  /**
+   * Returns expired processing leases to the pending set so they can be
+   * re-claimed by the next sweep.
+   */
+  async reclaimExpired(
+    now: number,
+    batchSize: number,
+    _isWebhook = false,
+  ): Promise<string[]> {
+    if (this.redis) {
+      return (await this.redis.eval(
+        RECLAIM_EXPIRED_SCRIPT,
+        2,
+        PROCESSING_KEY,
+        PENDING_KEY,
+        String(now),
+        String(batchSize),
+      )) as string[];
+    }
+
+    // In-memory fallback: only reclaim ids whose recorded lease has actually passed,
+    // mirroring RECLAIM_EXPIRED_SCRIPT's `ZRANGEBYSCORE ... '-inf' now` on the Redis path.
+    // A claim still inside its lease window belongs to a consumer that may still be
+    // (legitimately) mid-dispatch, not a crashed one — reclaiming it early would let two
+    // consumers process the same event concurrently, defeating the point of the lease.
+    const reclaimed: string[] = [];
+    for (const [id, leaseExpiresAt] of this.processing) {
+      if (reclaimed.length >= batchSize) break;
+      if (leaseExpiresAt > now) continue;
+      this.processing.delete(id);
+      this.pending.add(id);
+      reclaimed.push(id);
+    }
+    return reclaimed;
+  }
+
+  /**
+   * Marks an event as delivered, removes it from the processing set, and sets
+   * a TTL on the event body for retention-period cleanup.
+   */
+  async markDelivered(event: OutboxEvent, _isWebhook = false): Promise<void> {
+    const updated: OutboxEvent = {
+      ...event,
+      status: 'delivered',
+      deliveredAt: new Date().toISOString(),
+    };
 
     if (this.redis) {
-      const results = await this.redis
-        .multi()
-        .set(this.eventKey(event.id), JSON.stringify(event))
-        .expire(
-          this.eventKey(event.id),
-          config.OUTBOX_DELIVERED_TTL_SECONDS,
-        )
-        .zrem(processingKey, event.id)
-        .exec();
+      const ttl = config.OUTBOX_DELIVERED_TTL_SECONDS;
+      const tx = this.redis.multi();
+      if (ttl > 0) {
+        tx.set(this.eventKey(event.id), JSON.stringify(updated), 'EX', ttl);
+      } else {
+        tx.set(this.eventKey(event.id), JSON.stringify(updated));
+      }
+      tx.zrem(PROCESSING_KEY, event.id)
+        .zrem(PENDING_KEY, event.id);
+      const results = await tx.exec();
       this.assertTransactionOk(results);
       return;
     }
 
-    this.memory.set(event.id, event);
-    const processingMap = isWebhook ? this.webhookProcessing : this.processing;
-    processingMap.delete(event.id);
+    this.memory.set(event.id, updated);
+    this.processing.delete(event.id);
+    this.pending.delete(event.id);
   }
 
-  async retry(event: OutboxEvent, error: unknown, isWebhook = false): Promise<void> {
-    const pendingKey = isWebhook ? WEBHOOK_PENDING_KEY : PENDING_KEY;
-    const processingKey = isWebhook ? WEBHOOK_PROCESSING_KEY : PROCESSING_KEY;
-    event.attempts += 1;
-    event.lastError = error instanceof Error ? error.message : String(error);
-    const failed =
-      event.attempts >= config.OUTBOX_MAX_ATTEMPTS;
-    // Use 'retrying' status to distinguish retry attempts from initial pending state
-    event.status = failed ? 'failed' : 'retrying';
-    if (!failed) {
-      // Exponential backoff with cap at 30 seconds
-      event.nextAttemptAt =
-        Date.now() + Math.min(1000 * 2 ** Math.min(event.attempts - 1, 5), 30_000);
+  /**
+   * Purges delivered events older than `maxAgeSeconds`, measuring age from `deliveredAt`
+   * rather than `createdAt` — a message that sat pending for a long time before finally
+   * delivering still gets the full retention window counted from delivery, not creation
+   * (#988).
+   *
+   * Only the in-memory fallback needs this sweep: the Redis-backed path already retires a
+   * delivered event's body via a TTL set in `markDelivered()` at the moment of delivery
+   * (`config.OUTBOX_DELIVERED_TTL_SECONDS`), which is inherently delivered-time-based and
+   * never consults `createdAt`.
+   */
+  async purgeDeliveredOutboxMessages(
+    maxAgeSeconds: number = config.OUTBOX_DELIVERED_TTL_SECONDS,
+  ): Promise<number> {
+    if (this.redis || maxAgeSeconds <= 0) return 0;
+
+    const cutoff = Date.now() - maxAgeSeconds * 1000;
+    let purged = 0;
+    for (const [id, event] of this.memory.entries()) {
+      if (event.status !== 'delivered' || !event.deliveredAt) continue;
+      if (new Date(event.deliveredAt).getTime() >= cutoff) continue;
+
+      this.memory.delete(id);
+      purged++;
     }
 
+    if (purged > 0) {
+      this.logger.log(`purgeDeliveredOutboxMessages: purged ${purged} delivered event(s)`);
+    }
+    return purged;
+  }
+
+  /**
+   * Increments the attempt counter and reschedules the event with exponential
+   * backoff (capped at 30 s). Permanently fails the event once
+   * `config.OUTBOX_MAX_ATTEMPTS` is reached.
+   */
+  async retry(event: OutboxEvent, error: unknown, _isWebhook = false): Promise<void> {
+    const attempts = (event.attempts ?? 0) + 1;
+    const errMsg = error instanceof Error ? error.message : String(error);
+    const maxAttempts = config.OUTBOX_MAX_ATTEMPTS;
+    const failed = attempts >= maxAttempts;
+
+    const nextAttemptAt = failed
+      ? event.nextAttemptAt
+      : Date.now() + Math.min(1000 * 2 ** Math.min(attempts - 1, 5), 30_000);
+
+    const updated: OutboxEvent = {
+      ...event,
+      attempts,
+      lastError: errMsg,
+      status: failed ? 'failed' : 'retrying',
+      nextAttemptAt,
+    };
+
     if (this.redis) {
-      const transaction = this.redis
+      const tx = this.redis
         .multi()
-        .set(this.eventKey(event.id), JSON.stringify(event))
-        .zrem(processingKey, event.id);
-      if (!failed) transaction.zadd(pendingKey, event.nextAttemptAt, event.id);
-      const results = await transaction.exec();
+        .set(this.eventKey(event.id), JSON.stringify(updated))
+        .zrem(PROCESSING_KEY, event.id);
+      if (!failed) tx.zadd(PENDING_KEY, nextAttemptAt, event.id);
+      const results = await tx.exec();
       this.assertTransactionOk(results);
-      if (failed)
+
+      if (failed) {
         this.logger.error(
-          `Outbox event ${event.id} failed after ${event.attempts} attempts: ${event.lastError}`,
+          `Outbox event ${event.id} failed after ${attempts} attempts: ${errMsg}`,
         );
+      }
       return;
     }
 
-    this.memory.set(event.id, event);
-    const processingMap = isWebhook ? this.webhookProcessing : this.processing;
-    const pendingSet = isWebhook ? this.webhookPending : this.pending;
-    processingMap.delete(event.id);
+    this.memory.set(event.id, updated);
+    this.processing.delete(event.id);
     if (failed) {
       this.logger.error(
-        `Outbox event ${event.id} failed after ${event.attempts} attempts: ${event.lastError}`,
+        `Outbox event ${event.id} failed after ${attempts} attempts: ${errMsg}`,
       );
     } else {
-      pendingSet.add(event.id);
+      this.pending.add(event.id);
     }
   }
+
+  /**
+   * Fire-and-forget: queues a webhook event in the outbox.
+   *
+   * The first argument is reserved for a future Redis pipeline/transaction
+   * context and is intentionally typed as `null` — callers always pass `null`
+   * today, and the outbox handles its own persistence.
+   */
+  sendWebhook(
+    _ctx: null,
+    type: string,
+    payload: unknown,
+    dedupKey?: string,
+  ): void {
+    const event = this.create(type, 'webhook', dedupKey ?? type, payload);
+    if (dedupKey) (event as OutboxEvent).dedupKey = dedupKey;
+    this.append(event).catch(err =>
+      this.logger.error(`sendWebhook: failed to append event ${event.id}: ${err}`),
+    );
+  }
+
+  /** Finds a single event by ID. Returns undefined when not found. */
+  async findById(id: string): Promise<OutboxEvent | undefined> {
+    if (this.redis) {
+      const raw = await this.redis.get(this.eventKey(id));
+      if (!raw) return undefined;
+      return JSON.parse(raw) as OutboxEvent;
+    }
+    return this.memory.get(id);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // replayAll — admin bulk-replay of failed/dead events
+  // ══════════════════════════════════════════════════════════════════════════
+
+  async replayAll(): Promise<{ succeeded: string[]; failed: Array<{ id: string; reason: string }> }> {
+    const succeeded: string[] = [];
+    const failed: Array<{ id: string; reason: string }> = [];
+
+    // Redis path: scan for event bodies with status 'failed'
+    if (this.redis) {
+      const keys = await this.redis.keys(`${EVENT_KEY_PREFIX}*`);
+      for (const key of keys) {
+        const raw = await this.redis.get(key);
+        if (!raw) continue;
+        const event = JSON.parse(raw) as OutboxEvent;
+        if (event.status !== 'failed') continue;
+        try {
+          const reset: OutboxEvent = {
+            ...event,
+            status: 'pending',
+            attempts: 0,
+            lastError: undefined,
+            nextAttemptAt: Date.now(),
+          };
+          await this.redis
+            .multi()
+            .set(this.eventKey(event.id), JSON.stringify(reset))
+            .zadd(PENDING_KEY, reset.nextAttemptAt, event.id)
+            .exec();
+          succeeded.push(event.id);
+        } catch (err) {
+          failed.push({
+            id: event.id,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      this.logger.log(
+        `replayAll: ${succeeded.length} succeeded, ${failed.length} failed`,
+      );
+      return { succeeded, failed };
+    }
+
+    // In-memory path
+    for (const [id, event] of this.memory.entries()) {
+      if (event.status !== 'failed') continue;
+      try {
+        const reset: OutboxEvent = {
+          ...event,
+          status: 'pending',
+          attempts: 0,
+          lastError: undefined,
+          nextAttemptAt: Date.now(),
+        };
+        this.memory.set(id, reset);
+        this.pending.add(id);
+        succeeded.push(id);
+      } catch (err) {
+        failed.push({ id, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    return { succeeded, failed };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Legacy in-memory admin API (used by outbox.controller.ts and unit tests)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  async createEvent(eventType: OutboxEventType, payload: string): Promise<LegacyOutboxEvent> {
+    const id = `obx-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    const now = new Date();
+    const event: LegacyOutboxEvent = {
+      id,
+      eventType,
+      payload,
+      state: OutboxEventState.PENDING,
+      attempts: 0,
+      maxAttempts: this.legacyMaxAttempts,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.legacyEvents.set(id, event);
+    this.logger.log(`Created outbox event ${id} of type ${eventType}`);
+    return event;
+  }
+
+  async getEvents(filter?: { state?: OutboxEventState }): Promise<LegacyOutboxEvent[]> {
+    let all = [...this.legacyEvents.values()];
+    if (filter?.state) {
+      all = all.filter(e => e.state === filter.state);
+    }
+    return all;
+  }
+
+  async getEvent(id: string): Promise<LegacyOutboxEvent | undefined> {
+    return this.legacyEvents.get(id);
+  }
+
+  getDeadLetterEvents(): LegacyOutboxEvent[] {
+    return [...this.legacyEvents.values()].filter(
+      e => e.state === OutboxEventState.DEAD_LETTER,
+    );
+  }
+
+  async processEvent(id: string): Promise<{ success: boolean; error?: string }> {
+    const event = this.legacyEvents.get(id);
+    if (!event) throw new Error(`Outbox event ${id} not found`);
+    if (event.state === OutboxEventState.DEAD_LETTER) {
+      throw new Error(`Event ${id} is dead-lettered and must be replayed first`);
+    }
+    if (event.state === OutboxEventState.DELIVERED) {
+      return { success: true };
+    }
+
+    event.state = OutboxEventState.PROCESSING;
+    event.attempts += 1;
+    event.updatedAt = new Date();
+
+    try {
+      await this.attemptDelivery(event);
+      event.state = OutboxEventState.DELIVERED;
+      event.processedAt = new Date();
+      event.lastError = undefined;
+      this.logger.log(`Event ${id} delivered on attempt ${event.attempts}`);
+      return { success: true };
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      event.lastError = errMsg;
+      this.logger.warn(`Event ${id} delivery failed (attempt ${event.attempts}): ${errMsg}`);
+      if (event.attempts >= event.maxAttempts) {
+        event.state = OutboxEventState.DEAD_LETTER;
+        event.deadLetteredAt = new Date();
+        this.logger.error(
+          `Event ${id} exceeded max attempts (${event.maxAttempts}). Moved to dead letter queue.`,
+        );
+      } else {
+        event.state = OutboxEventState.FAILED;
+      }
+      return { success: false, error: errMsg };
+    }
+  }
+
+  async replayEvent(id: string): Promise<{ success: boolean; error?: string }> {
+    const event = this.legacyEvents.get(id);
+    if (!event) throw new Error(`Outbox event ${id} not found`);
+    if (event.state !== OutboxEventState.DEAD_LETTER) {
+      throw new Error(`Event ${id} is not in dead-letter state (current: ${event.state})`);
+    }
+    event.state = OutboxEventState.PENDING;
+    event.attempts = 0;
+    event.lastError = undefined;
+    event.deadLetteredAt = undefined;
+    event.updatedAt = new Date();
+    this.logger.log(`Replaying dead-lettered event ${id}`);
+    return this.processEvent(id);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Private helpers
+  // ══════════════════════════════════════════════════════════════════════════
 
   private eventKey(id: string): string {
     return `${EVENT_KEY_PREFIX}${id}`;
   }
 
-  private assertTransactionOk(results: Array<[Error | null, unknown]> | null): void {
-    if (!results) throw new Error('Redis outbox transaction aborted');
-    const failed = results.find(([error]) => error);
+  private assertTransactionOk(results: [Error | null, unknown][] | null): void {
+    if (!results) throw new Error('Redis MULTI/EXEC transaction aborted (null result)');
+    const failed = results.find(([err]) => err);
     if (failed) throw failed[0]!;
   }
 
-  private logFallback(operation: string): void {
-    this.metrics?.increment(OUTBOX_PERSISTENCE_FALLBACK_METRIC, { operation });
-    this.logger.warn(
-      `Redis unavailable for outbox.${operation}; using non-durable in-memory fallback`,
-    );
+  private async loadEvents(ids: string[]): Promise<OutboxEvent[]> {
+    if (!this.redis || ids.length === 0) return [];
+    const pipeline = this.redis.pipeline();
+    for (const id of ids) pipeline.get(this.eventKey(id));
+    const results = await pipeline.exec();
+    const events: OutboxEvent[] = [];
+    for (let i = 0; i < ids.length; i++) {
+      const [err, raw] = results![i]!;
+      if (err || !raw) {
+        // Body missing (e.g. crash between ZADD and SET) — leave in processing
+        // so reclaimExpired() eventually returns it to pending.
+        this.logger.warn(`Outbox event body missing for id ${ids[i]}: ${err ?? 'null'}`);
+        continue;
+      }
+      events.push(JSON.parse(raw as string) as OutboxEvent);
+    }
+    return events;
+  }
+
+  private async attemptDelivery(event: LegacyOutboxEvent): Promise<void> {
+    await new Promise(r => setTimeout(r, 10));
+    if (event.payload.includes('"shouldFail":true')) {
+      throw new Error('Simulated delivery failure');
+    }
   }
 }

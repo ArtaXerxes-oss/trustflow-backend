@@ -13,6 +13,7 @@ import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { CircuitBreakerService } from '../common/circuit-breaker';
 import { MetricsService } from '../monitoring/metrics.service';
+import { ProviderHealthService } from './provider-health.service';
 import { config } from '../config/env.config';
 import { computeCidV1Raw } from './cid.util';
 import { PinContentDto } from './ipfs-pinning.dto';
@@ -20,6 +21,7 @@ import {
   DEFAULT_REPLICATION_FACTOR,
   IPFS_EVENTS,
   PinRecord,
+  PinRedundancy,
   PinStatus,
   ProviderPinRecord,
   ProviderPinStatus,
@@ -41,18 +43,20 @@ export const IPFS_PINNING_PERSISTENCE_FALLBACK_METRIC = 'ipfs_pinning_persistenc
 export const IPFS_UNPIN_FAILURE_METRIC = 'ipfs_unpin_failure_total';
 
 /**
+ * Sequential provider priority order: Pinata → Infura → Web3.Storage.
+ * Order matches PinProviderName enum values: 'pinata', 'infura', 'web3.storage'.
+ * Providers are tried in this exact order until replicationFactor successes are achieved.
+ */
+export const PIN_PROVIDER_PRIORITY = ['pinata', 'infura', 'web3.storage'] as const;
+
+/**
  * Pin registry. Backed by Redis so pin metadata survives restarts and is shared across
  * instances — see PERSISTENT_STORAGE_SPIKE.md and its "Follow-up decisions" addendum (#189).
  *
- * Decision: drop retry-without-refetch entirely. The service no longer retains original bytes
- * for a pinned CID after the initial upload, so a later re-pin can only succeed if the caller
- * provides the content again. This keeps the system operational without introducing object-
- * storage infrastructure or a hidden per-process memory dependency. Reconcile/replicate now fail
- * explicitly when the content is missing instead of silently no-op'ing and leaving the pin
- * degraded indefinitely.
- *
- * Falls back to a process-local Map for pin metadata when Redis is unavailable, logged at
- * `error` level and counted via `IPFS_PINNING_PERSISTENCE_FALLBACK_METRIC`.
+ * Decision: enforce strict sequential failover across providers. After a successful
+ * pin to the first provider, a background job cross-pins to remaining providers
+ * for redundancy. Falls back to a process-local Map for pin metadata when Redis is
+ * unavailable, logged at `error` level and counted via `IPFS_PINNING_PERSISTENCE_FALLBACK_METRIC`.
  */
 @Injectable()
 export class IpfsPinningService implements OnModuleInit {
@@ -67,6 +71,7 @@ export class IpfsPinningService implements OnModuleInit {
     private readonly circuitBreakerService: CircuitBreakerService,
     @Optional() @Inject(REDIS_CLIENT) private readonly redis: Redis | null = null,
     @Optional() private readonly metrics?: MetricsService,
+    @Optional() private readonly providerHealth?: ProviderHealthService,
   ) {
     if (this.providers.length === 0) {
       throw new Error('IpfsPinningService requires at least one registered pin provider');
@@ -121,9 +126,12 @@ export class IpfsPinningService implements OnModuleInit {
 
   /**
    * Computes the content hash, verifies it against `expectedCid` (if supplied), then pins
-   * across providers in priority order until `replicationFactor` providers succeed —
-   * automatically failing over to the next provider whenever one throws or fails
-   * post-pin verification.
+   * across providers sequentially in priority order (Pinata → Infura → Web3.Storage) until
+   * `replicationFactor` providers succeed. After a successful pin, dispatches a background
+   * job to cross-pin to remaining providers for redundancy.
+   *
+   * The upload itself blocks until enough providers have confirmed, but the cross-pinning
+   * is fire-and-forge and does not delay the response.
    */
   async pinContent(dto: PinContentDto): Promise<PinRecord> {
     const buffer = Buffer.from(dto.content, 'base64');
@@ -159,6 +167,7 @@ export class IpfsPinningService implements OnModuleInit {
       filename: dto.filename,
       replicationFactor,
       status: PinStatus.FAILED,
+      redundancy: PinRedundancy.NONE,
       providers: [],
       createdAt: now,
       updatedAt: now,
@@ -168,14 +177,121 @@ export class IpfsPinningService implements OnModuleInit {
     record.replicationFactor = Math.max(record.replicationFactor, replicationFactor);
     await this.persist(record);
 
-    await this.replicate(record, buffer);
+    // Sequential, but exhaustive (#992): every registered provider is attempted and
+    // verified in priority order so the final status/redundancy reflects all of them,
+    // not just whichever ones were needed to satisfy replicationFactor.
+    // Get the ordered list of provider names from PIN_PROVIDER_PRIORITY
+    const providerNameOrder = PIN_PROVIDER_PRIORITY.filter(name => {
+      return this.providers.some(p => p.name === name);
+    });
 
-    if (isNew && this.countHealthy(record) > 0) {
-      await this.webhookService.dispatch(IPFS_EVENTS.PIN_CREATED, {
-        cid: record.cid,
-        replicationFactor: record.replicationFactor,
-        pinnedProviders: this.healthyProviders(record),
-      });
+    for (const providerName of providerNameOrder as PinProviderName[]) {
+      const provider = this.providers.find(p => p.name === providerName);
+      if (!provider) continue;
+
+      // Health latency is the real time this provider took, success or failure (#801).
+      const startedAt = Date.now();
+      const entry = this.upsertProviderEntry(record, providerName);
+      entry.attempts += 1;
+
+      try {
+        // Execute pin with circuit breaker
+        const pinResult = await this.circuitBreakerService.execute(
+          `ipfs-pin-${providerName}`,
+          async () => provider.pin(record.cid, buffer),
+          {
+            name: `ipfs-pin-${providerName}`,
+            timeout: 60000,
+            errorThresholdPercentage: 50,
+            // A single transient failure must not trip the breaker for every other call to
+            // this provider (opossum's default volumeThreshold is 0, i.e. one sample is
+            // enough to hit 100% error rate) — require a few samples first.
+            volumeThreshold: 3,
+            resetTimeout: 30000,
+          },
+        );
+
+        // Verify the pin was successful
+        const verified = await this.circuitBreakerService.execute(
+          `ipfs-verify-${providerName}`,
+          async () => provider.verify(record.cid),
+          {
+            name: `ipfs-verify-${providerName}`,
+            timeout: 30000,
+            errorThresholdPercentage: 50,
+            // A single transient failure must not trip the breaker for every other call to
+            // this provider (opossum's default volumeThreshold is 0, i.e. one sample is
+            // enough to hit 100% error rate) — require a few samples first.
+            volumeThreshold: 3,
+            resetTimeout: 30000,
+          },
+        );
+
+        if (!verified) throw new Error('Provider did not confirm the pin after upload');
+
+        entry.status = ProviderPinStatus.PINNED;
+        entry.pinnedAt = new Date().toISOString();
+        entry.lastVerifiedAt = entry.pinnedAt;
+        entry.lastError = undefined;
+
+        // Record health success
+        if (this.providerHealth) {
+          await this.providerHealth.recordPinSuccess(providerName, Date.now() - startedAt);
+        }
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        entry.status = ProviderPinStatus.FAILED;
+        entry.lastError = errMsg;
+
+        // Record health failure
+        if (this.providerHealth) {
+          await this.providerHealth.recordPinFailure(
+            providerName,
+            Date.now() - startedAt,
+            error as Error,
+          );
+        }
+
+        this.logger.warn(
+          `Provider ${providerName} failed to pin ${record.cid}: ${errMsg} — failing over`,
+        );
+
+        // Continue to next provider in sequence
+        continue;
+      }
+    }
+    // Every configured provider has now been attempted and verified synchronously — #992:
+    // this used to stop as soon as `replicationFactor` succeeded and cross-pin the rest in
+    // the background, so the response (and a caller checking it right after) could not tell
+    // whether the remaining providers actually ended up holding the content.
+
+    // Finalize status (relative to replicationFactor) and redundancy (relative to every
+    // registered provider) based on how many providers succeeded.
+    this.finalizeStatus(record);
+
+    await this.persist(record);
+
+    if (isNew) {
+      if (record.status === PinStatus.HEALTHY) {
+        await this.webhookService.dispatch(IPFS_EVENTS.PIN_CREATED, {
+          cid: record.cid,
+          replicationFactor: record.replicationFactor,
+          pinnedProviders: this.healthyProviders(record),
+        });
+      } else if (record.status === PinStatus.DEGRADED) {
+        await this.webhookService.dispatch(IPFS_EVENTS.PIN_DEGRADED, {
+          cid: record.cid,
+          healthyProviders: this.countHealthy(record),
+          replicationFactor: record.replicationFactor,
+        });
+      } else {
+        // Every registered provider failed to pin the content (#992): this must be
+        // surfaced as a hard failure, not a 201 that silently carries a FAILED record.
+        await this.webhookService.dispatch(IPFS_EVENTS.PIN_FAILED, { cid: record.cid });
+        throw new ServiceUnavailableException(
+          `Failed to pin ${record.cid} to any of the ${this.providers.length} registered provider(s)`,
+        );
+      }
     }
 
     return record;
@@ -209,20 +325,25 @@ export class IpfsPinningService implements OnModuleInit {
       }
     }
 
-    // Never top up replication for a pin the caller asked to remove. Original bytes are
-    // no longer retained after the initial pin, so a degraded pin cannot be topped up
-    // here; replicate() reports that explicitly instead of silently no-op'ing.
-    if (
-      record.status !== PinStatus.UNPINNING &&
-      this.countHealthy(record) < record.replicationFactor
-    ) {
-      await this.replicate(record).catch(error => {
-        this.logger.warn(
-          `Reconcile: unable to restore full replication for ${cid}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        throw error;
+    // Content is not retained after initial pin, so top-up replication is not possible
+    // from reconcile(). When the healthy count falls below the replication factor, surface
+    // this explicitly instead of silently re-persisting the same DEGRADED status.
+    if (this.countHealthy(record) < record.replicationFactor) {
+      this.finalizeStatus(record);
+      record.updatedAt = new Date().toISOString();
+      await this.persist(record);
+
+      this.logger.warn(
+        `Reconcile: ${cid} is below replication factor ` +
+          `(${this.countHealthy(record)}/${record.replicationFactor} healthy) ` +
+          `and original content is not retained — re-upload required to restore full replication.`,
+      );
+
+      await this.webhookService.dispatch(IPFS_EVENTS.PIN_DEGRADED, {
+        cid,
+        healthyProviders: this.countHealthy(record),
+        replicationFactor: record.replicationFactor,
+        reason: 'content-not-retained',
       });
     } else {
       this.finalizeStatus(record);
@@ -358,6 +479,7 @@ export class IpfsPinningService implements OnModuleInit {
           name: `ipfs-pin-${provider.name}`,
           timeout: 60000,
           errorThresholdPercentage: 50,
+          volumeThreshold: 3,
           resetTimeout: 30000,
         },
       );
@@ -369,6 +491,7 @@ export class IpfsPinningService implements OnModuleInit {
           name: `ipfs-verify-${provider.name}`,
           timeout: 30000,
           errorThresholdPercentage: 50,
+          volumeThreshold: 3,
           resetTimeout: 30000,
         },
       );
@@ -405,6 +528,7 @@ export class IpfsPinningService implements OnModuleInit {
           name: `ipfs-unpin-${name}`,
           timeout: 60000,
           errorThresholdPercentage: 50,
+          volumeThreshold: 3,
           resetTimeout: 30000,
         },
       );
@@ -414,6 +538,7 @@ export class IpfsPinningService implements OnModuleInit {
           name: `ipfs-verify-${name}`,
           timeout: 30000,
           errorThresholdPercentage: 50,
+          volumeThreshold: 3,
           resetTimeout: 30000,
         })
         .catch(() => true);
@@ -449,6 +574,11 @@ export class IpfsPinningService implements OnModuleInit {
     if (healthy === 0) record.status = PinStatus.FAILED;
     else if (healthy < record.replicationFactor) record.status = PinStatus.DEGRADED;
     else record.status = PinStatus.HEALTHY;
+
+    if (healthy === 0) record.redundancy = PinRedundancy.NONE;
+    else if (healthy >= this.providers.length) record.redundancy = PinRedundancy.FULL;
+    else record.redundancy = PinRedundancy.PARTIAL;
+
     record.updatedAt = new Date().toISOString();
   }
 

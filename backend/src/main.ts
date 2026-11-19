@@ -1,4 +1,5 @@
 import './config/load-dotenv.bootstrap';
+import { initTracing } from './monitoring/tracing';
 import { NestFactory } from '@nestjs/core';
 import * as Sentry from '@sentry/node';
 import { AppModule } from './app.module';
@@ -7,7 +8,13 @@ import { validateEnv, config } from './config/env.config';
 import { ShutdownService } from './common/shutdown/shutdown.service';
 import { SanitizedLogger } from './common/logging/sanitized-logger';
 import { SentryService } from './sentry/sentry.service';
-import { createDocsBasicAuth, isSwaggerEnabled } from './common/http/docs-security';
+import { SentryExceptionFilter } from './common/filters/sentry-exception.filter';
+import {
+  enableRequestContextLogging,
+  requestIdMiddleware,
+} from './common/logging/request-context';
+import { SorobanEventIndexerService } from './soroban-event-indexer/soroban-event-indexer.service';
+import { getCorsOrigin } from './cors.util';
 
 const logger = new SanitizedLogger('Bootstrap');
 
@@ -23,6 +30,9 @@ try {
   logger.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 }
+
+// Initialize OpenTelemetry tracing early so all subsequent operations are traced
+initTracing();
 
 // Capture unhandled promise rejections before the app is ready
 process.on('unhandledRejection', (reason: unknown) => {
@@ -42,19 +52,36 @@ process.on('uncaughtException', (error: Error) => {
 });
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  enableRequestContextLogging();
 
-  // The whole HTTP-level stack — security headers, body limits, Sentry, the exception
-  // filter, request timeouts, metrics, CORS, validation, API versioning, Swagger, and the
-  // Soroban indexer — is applied by `configureApp`. This used to be duplicated inline here
-  // and the copy had drifted badly: it referenced eight identifiers it never imported
-  // (including `express`, so the server died with `ReferenceError: express is not defined`
-  // on startup) and had silently dropped API versioning and the global request timeout.
-  // Sharing one implementation is what keeps production and the test suites in agreement.
-  const docsAuth = createDocsBasicAuth(config.SWAGGER_USER, config.SWAGGER_PASSWORD);
-  configureApp(app, {
-    skipSwagger: !isSwaggerEnabled(config),
-    ...(docsAuth ? { docsAuth } : {}),
+  const app = await NestFactory.create(AppModule);
+  app.use(requestIdMiddleware);
+
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: ["'self'", "'unsafe-inline'"],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          imgSrc: ["'self'", 'data:', 'https:'],
+          connectSrc: ["'self'", 'https:'],
+        },
+      },
+    }),
+  );
+
+  // Initialize Sentry via the injectable service so it shares the same instance
+  const sentryService = app.get(SentryService);
+  sentryService.init();
+
+  // Register global exception filter — captures 5xx errors to Sentry
+  app.useGlobalFilters(new SentryExceptionFilter(sentryService));
+
+  // Enable CORS
+  app.enableCors({
+    origin: getCorsOrigin(),
+    credentials: true,
   });
 
   const swaggerEnabled = isSwaggerEnabled(config);
@@ -66,6 +93,12 @@ async function bootstrap() {
   // SIGINT handlers: it flips readiness to failing, drains in-flight requests within
   // SHUTDOWN_TIMEOUT_MS, runs Nest's lifecycle hooks (ending the PostgreSQL pool), then exits.
   app.get(ShutdownService).registerApp(app);
+
+  // Shut down the OTel SDK after the HTTP server has drained so all in-flight
+  // spans are flushed before the process exits.
+  if (otelSdk) {
+    process.once('beforeExit', () => otelSdk.shutdown());
+  }
 
   logger.log(`🚀 TrustFlow API running on: http://localhost:${port}`);
   if (swaggerEnabled) {

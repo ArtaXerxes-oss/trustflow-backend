@@ -1,13 +1,17 @@
 import { Inject, Injectable, Optional } from '@nestjs/common';
+import { HealthCheckService, HealthIndicatorResult, HealthCheckResult } from '@nestjs/terminus';
 import type { Redis } from 'ioredis';
 import { DatabaseService } from '../common/database/database.service';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { DrainStateService } from '../common/shutdown/drain-state.service';
+import { IngestionHealthService } from './ingestion-health.service';
+import { StellarProtocolCompatibilityService } from './stellar-protocol-compatibility.service';
 import { config } from '../config/env.config';
 
 export interface HealthStatus {
   status: 'ok' | 'degraded' | 'down';
   checks: Record<string, boolean>;
+  details?: HealthCheckResult;
   uptime: number;
 }
 
@@ -18,6 +22,7 @@ export interface LivenessProbe {
 export interface ReadinessProbe {
   status: 'ok' | 'degraded' | 'down';
   checks: Record<string, boolean>;
+  details?: HealthCheckResult;
 }
 
 @Injectable()
@@ -28,6 +33,9 @@ export class HealthService {
     @Optional() private readonly database?: DatabaseService,
     @Optional() @Inject(REDIS_CLIENT) private readonly redis?: Redis | null,
     @Optional() private readonly drainState?: DrainStateService,
+    @Optional() private readonly health?: HealthCheckService,
+    @Optional() private readonly ingestionHealth?: IngestionHealthService,
+    @Optional() private readonly protocolCompatibility?: StellarProtocolCompatibilityService,
   ) {}
 
   async liveness(): Promise<LivenessProbe> {
@@ -48,29 +56,35 @@ export class HealthService {
     }
 
     const checks = await this.runAllChecks();
+    const healthDetails = await this.runTerminusHealthChecks();
     const failing = Object.values(checks).filter(v => !v).length;
     return {
       status: failing === 0 ? 'ok' : failing < 2 ? 'degraded' : 'down',
       checks,
+      details: healthDetails,
     };
   }
 
   async check(): Promise<HealthStatus> {
     const checks = await this.runAllChecks();
+    const healthDetails = await this.runTerminusHealthChecks();
     const failing = Object.values(checks).filter(v => !v).length;
     return {
       status: failing === 0 ? 'ok' : failing < 2 ? 'degraded' : 'down',
       checks,
+      details: healthDetails,
       uptime: Date.now() - this.startTime,
     };
   }
 
   private async runAllChecks(): Promise<Record<string, boolean>> {
-    const [stellar, database, redis, memory] = await Promise.all([
+    const [stellar, database, redis, memory, eventIngestion, stellarProtocol] = await Promise.all([
       this.checkStellar(),
       this.checkDatabase(),
       this.checkRedis(),
       this.checkMemory(),
+      this.checkEventIngestion(),
+      this.checkProtocolCompatibility(),
     ]);
 
     return {
@@ -79,6 +93,8 @@ export class HealthService {
       database,
       redis,
       memory,
+      eventIngestion,
+      stellarProtocol,
     };
   }
 
@@ -126,5 +142,105 @@ export class HealthService {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Whether event ingestion has polled the chain recently, not just that its loop is
+   * running — a poller stuck in a tight error-retry loop (e.g. bad RPC credentials) keeps
+   * its process alive while never making progress (#987).
+   */
+  private checkEventIngestion(): Promise<boolean> {
+    return Promise.resolve(this.ingestionHealth?.isHealthy() ?? true);
+  }
+
+  /**
+   * Whether the Soroban RPC node's protocol version (read once at startup) falls inside the
+   * range this backend was tested against. Unconfigured/unreachable reports healthy — that
+   * failure mode already shows up in `stellar` (#980).
+   */
+  private checkProtocolCompatibility(): Promise<boolean> {
+    return Promise.resolve(this.protocolCompatibility?.getStatus().compatible ?? true);
+  }
+
+  /**
+   * Run Terminus-based structured health checks for detailed dependency breakdown.
+   * Provides rich JSON health information for DevOps monitoring and Kubernetes probes.
+   */
+  private async runTerminusHealthChecks(): Promise<HealthCheckResult | undefined> {
+    if (!this.health) return undefined;
+
+    try {
+      return await this.health.check([
+        async (): Promise<HealthIndicatorResult> => this.checkPostgresIndicator(),
+        async (): Promise<HealthIndicatorResult> => this.checkRedisIndicator(),
+        async (): Promise<HealthIndicatorResult> => this.checkSorobanRpcIndicator(),
+        async (): Promise<HealthIndicatorResult> => this.checkEventIngestionIndicator(),
+        (): HealthIndicatorResult => this.checkProtocolCompatibilityIndicator(),
+      ]);
+    } catch (error) {
+      // Terminus throws on failure — return the error result
+      return error as HealthCheckResult;
+    }
+  }
+
+  /** Postgres health indicator for Terminus */
+  private async checkPostgresIndicator(): Promise<HealthIndicatorResult> {
+    const isHealthy = await this.checkDatabase();
+    return {
+      postgres: {
+        status: isHealthy ? 'up' : 'down',
+        configured: this.database?.isConfigured ?? false,
+      },
+    };
+  }
+
+  /** Redis health indicator for Terminus */
+  private async checkRedisIndicator(): Promise<HealthIndicatorResult> {
+    const isHealthy = await this.checkRedis();
+    return {
+      redis: {
+        status: isHealthy ? 'up' : 'down',
+        configured: !!this.redis,
+      },
+    };
+  }
+
+  /** Soroban RPC node health indicator for Terminus */
+  private async checkSorobanRpcIndicator(): Promise<HealthIndicatorResult> {
+    const isHealthy = await this.checkStellar();
+    return {
+      soroban_rpc: {
+        status: isHealthy ? 'up' : 'down',
+        url: config.STELLAR_HORIZON_URL,
+      },
+    };
+  }
+
+  /** Event ingestion health indicator for Terminus, surfacing the last successful poll (#987) */
+  private async checkEventIngestionIndicator(): Promise<HealthIndicatorResult> {
+    const isHealthy = await this.checkEventIngestion();
+    return {
+      event_ingestion: {
+        status: isHealthy ? 'up' : 'down',
+        lastSuccessfulPollAt:
+          this.ingestionHealth?.getLastSuccessfulPollAt()?.toISOString() ?? null,
+      },
+    };
+  }
+
+  /** Soroban RPC protocol-version compatibility indicator for Terminus (#980) */
+  private checkProtocolCompatibilityIndicator(): HealthIndicatorResult {
+    const status = this.protocolCompatibility?.getStatus();
+    return {
+      stellar_protocol: {
+        status: (status?.compatible ?? true) ? 'up' : 'down',
+        checked: status?.checked ?? false,
+        protocolVersion: status?.protocolVersion ?? null,
+        supportedRange: [
+          status?.minSupported ?? config.SOROBAN_PROTOCOL_MIN_VERSION,
+          status?.maxSupported ?? config.SOROBAN_PROTOCOL_MAX_VERSION,
+        ],
+      },
+    };
   }
 }

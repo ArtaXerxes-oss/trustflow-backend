@@ -14,6 +14,10 @@ import { NotificationService } from '../notification/notification.service';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { MetricsService } from '../monitoring/metrics.service';
 import { EscrowChainStateClient } from '../escrow-reconciliation/escrow-chain-state.client';
+import { DISPUTE_EVIDENCE_PINNER } from './dispute-evidence.pinner';
+import { SubmitEvidenceDto } from './dispute.dto';
+import { MAX_BASE64_CONTENT_LENGTH } from '../ipfs-pinning/ipfs-pinning.types';
+import { validateSync } from 'class-validator';
 
 // ─── Shared mock factories ────────────────────────────────────────────────────
 
@@ -108,6 +112,7 @@ describe('DisputeSagaService', () => {
   let notificationService: ReturnType<typeof buildMocks>['notificationService'];
   let escrow: ReturnType<typeof buildMocks>['escrow'];
   let discordService: ReturnType<typeof buildMocks>['discordService'];
+  let ipfsPinningService: { pinContent: jest.Mock };
 
   beforeEach(async () => {
     const mocks = buildMocks();
@@ -126,10 +131,15 @@ describe('DisputeSagaService', () => {
         { provide: REDIS_CLIENT, useValue: null },
         { provide: MetricsService, useValue: { increment: jest.fn() } },
         { provide: DiscordService, useValue: discordService },
+        {
+          provide: DISPUTE_EVIDENCE_PINNER,
+          useValue: { pinContent: jest.fn().mockResolvedValue({ cid: 'bafkrei-test', size: 4 }) },
+        },
       ],
     }).compile();
 
     service = module.get<DisputeSagaService>(DisputeSagaService);
+    ipfsPinningService = module.get(DISPUTE_EVIDENCE_PINNER);
   });
 
   it('should be defined', () => {
@@ -518,6 +528,54 @@ describe('DisputeSagaService', () => {
         service.castVote(sagaId, { jurorAddress: JURORS[0], vote: 'beneficiary' }),
       ).rejects.toThrow(ConflictException);
     });
+
+    it('dispatches vote_cast webhook', async () => {
+      await service.castVote(sagaId, { jurorAddress: JURORS[0], vote: 'depositor' });
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        'dispute.vote_cast',
+        expect.objectContaining({ sagaId, jurorAddress: JURORS[0] }),
+      );
+    });
+
+    it('dispatches verdict_reached webhook once the final vote is cast', async () => {
+      await service.castVote(sagaId, { jurorAddress: JURORS[0], vote: 'depositor' });
+      await service.castVote(sagaId, { jurorAddress: JURORS[1], vote: 'depositor' });
+      expect(webhookService.dispatch).not.toHaveBeenCalledWith(
+        'dispute.verdict_reached',
+        expect.anything(),
+      );
+
+      await service.castVote(sagaId, { jurorAddress: JURORS[2], vote: 'beneficiary' });
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        'dispute.verdict_reached',
+        expect.objectContaining({ sagaId, verdict: DisputeVerdict.DEPOSITOR_WINS }),
+      );
+    });
+
+    it('dispatches vote_cast and verdict_reached only after the saga has been persisted (#985)', async () => {
+      const persist = jest.spyOn(service as unknown as SagaPersistence, 'persistSaga');
+
+      await service.castVote(sagaId, { jurorAddress: JURORS[0], vote: 'depositor' });
+      await service.castVote(sagaId, { jurorAddress: JURORS[1], vote: 'depositor' });
+      await service.castVote(sagaId, { jurorAddress: JURORS[2], vote: 'beneficiary' });
+
+      const persistOrders = persist.mock.invocationCallOrder;
+      const lastPersistOrder = persistOrders[persistOrders.length - 1];
+      const dispatchedEvents: string[] = webhookService.dispatch.mock.calls.map(
+        (call: unknown[]) => call[0] as string,
+      );
+      const voteCastCall = dispatchedEvents.indexOf('dispute.vote_cast');
+      const verdictCall = dispatchedEvents.indexOf('dispute.verdict_reached');
+      expect(voteCastCall).toBeGreaterThanOrEqual(0);
+      expect(verdictCall).toBeGreaterThanOrEqual(0);
+
+      // Every dispatch() call order for this final vote's webhooks must come after
+      // the last persistSaga() call order — i.e. the webhook never fires before commit.
+      const dispatchOrdersForFinalVote = webhookService.dispatch.mock.invocationCallOrder.slice(-2);
+      for (const order of dispatchOrdersForFinalVote) {
+        expect(order).toBeGreaterThan(lastPersistOrder);
+      }
+    });
   });
 
   // ─── executePayout ────────────────────────────────────────────────
@@ -756,6 +814,54 @@ describe('DisputeSagaService', () => {
         'dispute.saga_failed',
         expect.objectContaining({ reason: 'DB failure' }),
       );
+    });
+  });
+
+  describe('evidence attachments', () => {
+    const validDto: SubmitEvidenceDto = { content: 'SGVsbG8=', filename: 'proof.txt' };
+
+    it('rejects an oversized base64 payload using the shared size limit', () => {
+      const dto = Object.assign(new SubmitEvidenceDto(), {
+        content: 'A'.repeat(MAX_BASE64_CONTENT_LENGTH + 4),
+        filename: 'huge.bin',
+      });
+
+      const errors = validateSync(dto);
+
+      expect(errors.some(e => e.property === 'content')).toBe(true);
+    });
+
+    it('accepts a payload exactly at the shared size limit', () => {
+      const dto = Object.assign(new SubmitEvidenceDto(), {
+        content: 'A'.repeat(MAX_BASE64_CONTENT_LENGTH),
+        filename: 'at-limit.bin',
+      });
+
+      expect(validateSync(dto)).toHaveLength(0);
+    });
+
+    it('pins evidence and records its CID on the saga', async () => {
+      await service.escalate('esc-001', ESCALATE_DTO);
+      const saga = (await service.findByEscrowId('esc-001'))!;
+
+      const evidence = await service.attachEvidence(saga.sagaId, validDto, escrow.depositor);
+
+      expect(ipfsPinningService.pinContent).toHaveBeenCalledWith({
+        content: validDto.content,
+        filename: validDto.filename,
+      });
+      expect(evidence).toEqual(
+        expect.objectContaining({ cid: 'bafkrei-test', size: 4, submittedBy: escrow.depositor }),
+      );
+      const updated = await service.findById(saga.sagaId);
+      expect(updated.evidence).toEqual([evidence]);
+    });
+
+    it('does not contact pinning storage for an unknown saga', async () => {
+      await expect(service.attachEvidence('no-such-saga', validDto, 'GTEST')).rejects.toThrow(
+        'Dispute saga no-such-saga not found',
+      );
+      expect(ipfsPinningService.pinContent).not.toHaveBeenCalled();
     });
   });
 });

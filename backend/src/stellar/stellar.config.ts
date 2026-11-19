@@ -1,4 +1,5 @@
 import { config } from '../config/env.config';
+import { normalizeContractId } from './contract-id.util';
 
 const VALID_NETWORKS = ['TESTNET', 'PUBLIC'] as const;
 type StellarNetworkValue = (typeof VALID_NETWORKS)[number];
@@ -58,15 +59,15 @@ export function getStellarConfig(): StellarConfig {
 
   cachedStellarConfig = {
     network: normalizedNetwork as StellarNetworkValue,
-    horizonUrl: config.STELLAR_HORIZON_URL,
-    sorobanRpcUrl: config.SOROBAN_RPC_URL,
-    horizonEndpoints: (config.STELLAR_HORIZON_ENDPOINTS || config.STELLAR_HORIZON_URL)
+    horizonUrl: config.STELLAR_HORIZON_URL!,
+    sorobanRpcUrl: config.SOROBAN_RPC_URL!,
+    horizonEndpoints: (config.STELLAR_HORIZON_ENDPOINTS || config.STELLAR_HORIZON_URL!)
       .split(',')
       .map(url => url.trim()),
-    sorobanRpcEndpoints: (config.SOROBAN_RPC_ENDPOINTS || config.SOROBAN_RPC_URL)
+    sorobanRpcEndpoints: (config.SOROBAN_RPC_ENDPOINTS || config.SOROBAN_RPC_URL!)
       .split(',')
       .map(url => url.trim()),
-    contractId: config.TRUSTFLOW_CONTRACT_ID || '',
+    contractId: normalizeContractId(config.TRUSTFLOW_CONTRACT_ID || ''),
     networkPassphrase: NETWORK_PASSPHRASES[normalizedNetwork as StellarNetworkValue],
   };
 

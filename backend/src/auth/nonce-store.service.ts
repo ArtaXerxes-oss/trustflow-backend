@@ -6,6 +6,12 @@ import { REDIS_CLIENT } from '../common/redis/redis.module';
 const NONCE_TTL_SECONDS = 60;
 const CONSUMED_TTL_SECONDS = 300;
 
+export interface WalletRateLimitResult {
+  allowed: boolean;
+  /** Seconds until the caller should retry; 0 when `allowed` is true. */
+  retryAfter: number;
+}
+
 const GETDEL_LUA = `
 local val = redis.call('GET', KEYS[1])
 if val then
@@ -14,12 +20,21 @@ end
 return val
 `;
 
+const INCR_WITH_EXPIRE_LUA = `
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return current
+`;
+
 @Injectable()
 export class NonceStoreService {
   private readonly logger = new SanitizedLogger(NonceStoreService.name);
 
   private readonly inMemoryChallenges = new Map<string, { challenge: string; expiresAt: number }>();
   private readonly inMemoryConsumed = new Map<string, number>();
+  private readonly inMemoryWalletChallengeCounts = new Map<string, { count: number; resetAt: number }>();
 
   private get redis(): Redis | null {
     return this.redisClient;
@@ -67,27 +82,47 @@ export class NonceStoreService {
     }
   }
 
-  async store(address: string, challenge: string, _nonce: string): Promise<void> {
+  /**
+   * Stores `challenge` as the pending challenge for `address` and returns the challenge the
+   * caller should sign. A live challenge is never replaced (#369): `/auth/challenge` is
+   * unauthenticated, so replacing on every request let anyone cancel another wallet's
+   * in-flight login by asking for a fresh challenge. Instead the existing, still-valid
+   * challenge is returned — it is not secret, only the wallet's key can sign it.
+   */
+  async store(address: string, challenge: string, _nonce: string): Promise<string> {
     const key = this.challengeKey(address);
 
     if (this.redis) {
       try {
         const result = await this.redis.set(key, challenge, 'EX', NONCE_TTL_SECONDS, 'NX');
-        if (!result) {
-          this.logger.warn(`Challenge already exists for ${this.maskAddress(address)}, replacing`);
-          await this.redis.set(key, challenge, 'EX', NONCE_TTL_SECONDS);
+        if (result) return challenge;
+
+        const existing = await this.redis.get(key);
+        if (existing) {
+          this.logger.debug(
+            `Live challenge already pending for ${this.maskAddress(address)}, reusing it`,
+          );
+          return existing;
         }
-        return;
+        // Expired between the SET NX and the GET — claim the slot again.
+        const retry = await this.redis.set(key, challenge, 'EX', NONCE_TTL_SECONDS, 'NX');
+        return retry ? challenge : ((await this.redis.get(key)) ?? challenge);
       } catch (err) {
         this.logger.warn('Redis unavailable for nonce store, falling back to memory');
       }
+    }
+
+    this.cleanupExpiredEntries();
+    const existing = this.inMemoryChallenges.get(key);
+    if (existing && Date.now() <= existing.expiresAt) {
+      return existing.challenge;
     }
 
     this.inMemoryChallenges.set(key, {
       challenge,
       expiresAt: Date.now() + NONCE_TTL_SECONDS * 1000,
     });
-    this.cleanupExpiredEntries();
+    return challenge;
   }
 
   async consume(address: string): Promise<string | null> {
@@ -167,6 +202,51 @@ export class NonceStoreService {
     return true;
   }
 
+  /**
+   * Fixed-window counter on the challenge-target wallet address, independent of the caller's
+   * IP (#993). `/auth/challenge` is unauthenticated and only ever IP-limited, so a script
+   * spread across many IPs/proxies could otherwise mint unlimited pending challenges for one
+   * target wallet, each consuming Redis memory until its 60s TTL. This is keyed on the
+   * `address` itself — the same key `store()` writes to — regardless of which IP asked.
+   */
+  async checkWalletChallengeRateLimit(
+    address: string,
+    points: number,
+    durationSeconds: number,
+  ): Promise<WalletRateLimitResult> {
+    const key = this.walletChallengeRateLimitKey(address);
+
+    if (this.redis) {
+      try {
+        const count = Number(
+          await this.redis.eval(INCR_WITH_EXPIRE_LUA, 1, key, durationSeconds),
+        );
+        if (count > points) {
+          const ttl = await this.redis.ttl(key);
+          return { allowed: false, retryAfter: ttl > 0 ? ttl : durationSeconds };
+        }
+        return { allowed: true, retryAfter: 0 };
+      } catch (err) {
+        this.logger.warn('Redis unavailable for wallet challenge rate limit, falling back to memory');
+      }
+    }
+
+    this.cleanupExpiredEntries();
+    const now = Date.now();
+    const entry = this.inMemoryWalletChallengeCounts.get(key);
+
+    if (!entry || now > entry.resetAt) {
+      this.inMemoryWalletChallengeCounts.set(key, { count: 1, resetAt: now + durationSeconds * 1000 });
+      return { allowed: true, retryAfter: 0 };
+    }
+
+    entry.count += 1;
+    if (entry.count > points) {
+      return { allowed: false, retryAfter: Math.ceil((entry.resetAt - now) / 1000) };
+    }
+    return { allowed: true, retryAfter: 0 };
+  }
+
   async hasActiveChallenge(address: string): Promise<boolean> {
     const key = this.challengeKey(address);
 
@@ -200,6 +280,11 @@ export class NonceStoreService {
         this.inMemoryConsumed.delete(key);
       }
     }
+    for (const [key, entry] of this.inMemoryWalletChallengeCounts.entries()) {
+      if (now > entry.resetAt) {
+        this.inMemoryWalletChallengeCounts.delete(key);
+      }
+    }
   }
 
   private challengeKey(address: string): string {
@@ -208,6 +293,10 @@ export class NonceStoreService {
 
   private nonceKey(nonce: string): string {
     return `auth:nonce:used:${nonce}`;
+  }
+
+  private walletChallengeRateLimitKey(address: string): string {
+    return `auth:challenge:wallet-ratelimit:${address}`;
   }
 
   private maskAddress(address: string): string {

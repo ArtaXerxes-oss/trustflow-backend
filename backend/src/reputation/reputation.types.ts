@@ -20,6 +20,33 @@ export interface ReputationEventLogEntry {
   counterparty: string;
   contribution: number;
   occurredAt: string;
+  /** Base weight for `type` before amount scaling/dampening — see REPUTATION_WEIGHTS. */
+  baseWeight: number;
+  /** log10(amountXLM)-based scaling factor, capped at REPUTATION_MAX_AMOUNT_WEIGHT (#977). */
+  amountWeight: number;
+  /** Sybil dampening applied for repeated interactions with this counterparty (1 / (1 + priorInteractions)). */
+  dampeningFactor: number;
+}
+
+/**
+ * `ReputationEventLogEntry` plus how much of this single event's contribution remains after
+ * decaying it from its own `occurredAt` to "now" — for transparency/audit purposes only
+ * (#989). The materialized score itself is never decayed per event; it decays as one
+ * aggregate from `lastUpdatedAt` (see the `decay()` doc comment on `ReputationService`), so
+ * this is an illustrative approximation of "how much this event still counts for", not a
+ * stored ledger value, and the sum of `decayedContribution` across events will not exactly
+ * equal the current `score`.
+ */
+export interface ReputationBreakdownEntry extends ReputationEventLogEntry {
+  decayedContribution: number;
+}
+
+export interface ReputationScoreBreakdown {
+  address: string;
+  score: number;
+  eventCount: number;
+  lastUpdatedAt: string;
+  events: ReputationBreakdownEntry[];
 }
 
 /** Materialized, incrementally-updated score record for a single address. */
@@ -71,10 +98,13 @@ export const REPUTATION_WEIGHTS: Record<ReputationEventType, number> = {
 };
 
 /**
- * Caps how much a single high-value escrow can scale a contribution (amountWeight = sqrt(amountXLM),
- * capped here). Square-root rather than linear scaling so a 10,000 XLM escrow counts for meaningfully
- * more than a 100 XLM one without letting a single whale transaction single-handedly dominate an
- * address's score; the cap puts a hard ceiling under that same goal even for extreme amounts.
+ * Caps how much a single high-value escrow can scale a contribution
+ * (amountWeight = 1 + log10(amountXLM), capped here). Logarithmic rather than linear scaling
+ * so a 10,000 XLM escrow counts for meaningfully more than a 100 XLM one without letting a
+ * single whale transaction single-handedly dominate an address's score, while still
+ * differentiating budgets across many more orders of magnitude than a low, early-saturating
+ * cap would (#977) — the cap here only guards against overflow/an absurd amount, reached
+ * only around 1 billion XLM.
  */
 export const REPUTATION_MAX_AMOUNT_WEIGHT = 10;
 

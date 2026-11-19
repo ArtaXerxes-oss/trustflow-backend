@@ -1,21 +1,22 @@
-import { ArgumentsHost, HttpException, HttpStatus } from '@nestjs/common';
+import { ArgumentsHost, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import * as Sentry from '@sentry/node';
 import { SentryExceptionFilter } from './sentry-exception.filter';
 import { SentryService } from '../../sentry/sentry.service';
+import { enableRequestContextLogging, runWithRequestContext } from '../logging/request-context';
 
-jest.mock('@sentry/node', () => ({
-  captureException: jest.fn(),
-  withScope: jest.fn((cb: (scope: unknown) => unknown) => {
-    const scope = { setTag: jest.fn(), setExtra: jest.fn(), setUser: jest.fn() };
-    return cb(scope);
-  }),
-}));
-
-function buildHost(url = '/test', method = 'GET', ip = '127.0.0.1') {
+function buildHost(
+  url = '/test',
+  method = 'GET',
+  ip = '127.0.0.1',
+  requestId?: string,
+) {
   const response = {
     status: jest.fn().mockReturnThis(),
     json: jest.fn(),
+    setHeader: jest.fn(),
   };
-  const request = { url, method, ip };
+  const headers = requestId ? { 'x-request-id': requestId } : {};
+  const request = { url, method, ip, headers, get: (name: string) => headers[name.toLowerCase()] };
   return {
     switchToHttp: () => ({
       getResponse: () => response,
@@ -32,6 +33,7 @@ describe('SentryExceptionFilter', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    enableRequestContextLogging();
     sentryService = {
       captureException: jest.fn().mockReturnValue('evt-id'),
       isInitialized: jest.fn().mockReturnValue(true),
@@ -184,6 +186,86 @@ describe('SentryExceptionFilter', () => {
       expect(body).toHaveProperty('timestamp');
       expect(body).toHaveProperty('path', '/api/auth/login');
       expect(body).toHaveProperty('statusCode', 500);
+    });
+  });
+
+  it('should propagate the request id to the logger and Sentry tags for the same request', () => {
+    const requestId = 'req-123';
+    const setTag = jest.fn();
+    const setExtra = jest.fn();
+    const setUser = jest.fn();
+    const withScopeSpy = jest.spyOn(Sentry, 'withScope' as never).mockImplementation(
+      ((scopeOrCallback: unknown, callback?: (scope: any) => unknown) => {
+        const scope = { setTag, setExtra, setUser };
+        if (typeof scopeOrCallback === 'function') {
+          return (scopeOrCallback as (scope: any) => unknown)(scope);
+        }
+        return callback ? callback(scope) : undefined;
+      }) as never,
+    );
+    const logSpy = jest.spyOn(Logger.prototype, 'error');
+
+    runWithRequestContext(requestId, () => {
+      filter.catch(new Error('crash'), buildHost('/api/auth/login', 'POST', '127.0.0.1', requestId));
+    });
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(`requestId=${requestId}`), expect.any(String));
+    expect(setTag).toHaveBeenCalledWith('request_id', requestId);
+    expect(setTag).toHaveBeenCalledWith('correlation_id', requestId);
+    expect(withScopeSpy).toHaveBeenCalled();
+  });
+  describe('database error handling (#917, #918)', () => {
+    it('returns 503 Service Unavailable with Retry-After on connection pool exhaustion (#917)', () => {
+      const host = buildHost('/test', 'GET');
+      const poolError = new Error('ConnectionAcquisitionTimeoutError: Pool exhausted');
+      (poolError as any).name = 'ConnectionAcquisitionTimeoutError';
+
+      filter.catch(poolError, host);
+
+      expect(host.response.status).toHaveBeenCalledWith(HttpStatus.SERVICE_UNAVAILABLE);
+      expect(host.response.setHeader).toHaveBeenCalledWith('Retry-After', '5');
+      expect(host.response.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+          message: 'Database connection pool busy. Please retry shortly.',
+        }),
+      );
+    });
+
+    it('maps unique constraint violation 23505 to 409 Conflict without leaking SQL internals (#918)', () => {
+      const host = buildHost('/test', 'POST');
+      const sqlError = new Error(
+        'duplicate key value violates unique constraint "ratings_deliverable_id_rater_wallet_key"',
+      );
+      (sqlError as any).code = '23505';
+      (sqlError as any).table = 'ratings';
+      (sqlError as any).constraint = 'ratings_deliverable_id_rater_wallet_key';
+
+      filter.catch(sqlError, host);
+
+      expect(host.response.status).toHaveBeenCalledWith(HttpStatus.CONFLICT);
+      expect(host.response.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: HttpStatus.CONFLICT,
+          message: 'Resource already exists',
+        }),
+      );
+    });
+
+    it('sanitizes generic unhandled Postgres driver errors without leaking raw SQL details (#918)', () => {
+      const host = buildHost('/test', 'POST');
+      const sqlError = new Error('syntax error at or near "SELECT * FROM secret_table"');
+      (sqlError as any).code = '42601';
+
+      filter.catch(sqlError, host);
+
+      expect(host.response.status).toHaveBeenCalledWith(HttpStatus.INTERNAL_SERVER_ERROR);
+      expect(host.response.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+          message: 'Database operation failed',
+        }),
+      );
     });
   });
 });

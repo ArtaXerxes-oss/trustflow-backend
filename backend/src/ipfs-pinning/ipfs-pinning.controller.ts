@@ -12,6 +12,8 @@ import {
 import { ApiTags, ApiOperation, ApiParam, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { IpfsPinningService } from './ipfs-pinning.service';
 import { PinContentDto, PinRecordResponseDto } from './ipfs-pinning.dto';
+import { ProviderHealthService } from './provider-health.service';
+import { Inject, Optional } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/auth.guard';
 import { AdminGuard } from '../admin/admin.guard';
 
@@ -20,7 +22,10 @@ import { AdminGuard } from '../admin/admin.guard';
 @UseGuards(JwtAuthGuard)
 @Controller('ipfs/pins')
 export class IpfsPinningController {
-  constructor(private readonly pinningService: IpfsPinningService) {}
+  constructor(
+    private readonly pinningService: IpfsPinningService,
+    @Optional() @Inject(ProviderHealthService) private readonly providerHealth?: ProviderHealthService,
+  ) {}
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
@@ -46,6 +51,21 @@ export class IpfsPinningController {
   @ApiResponse({ status: 403, description: 'Forbidden — admin privileges required' })
   findAll() {
     return this.pinningService.findAll();
+  }
+
+  @Get('health')
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Get provider health status' })
+  @ApiResponse({ status: 200, type: Object })
+  @ApiResponse({ status: 401, description: 'Unauthorized — valid JWT required' })
+  @ApiResponse({ status: 403, description: 'Forbidden — admin privileges required' })
+  async getProviderHealth() {
+    if (!this.providerHealth) {
+      return { error: 'Provider health service not available' };
+    }
+    const providers = ['pinata', 'infura', 'web3storage'];
+    const health = await this.providerHealth.getAllProviderHealth(providers);
+    return { providers: health };
   }
 
   @Get(':cid')
@@ -97,5 +117,26 @@ export class IpfsPinningController {
   })
   unpin(@Param('cid') cid: string) {
     return this.pinningService.unpin(cid);
+  }
+
+  @Post('providers/:name/health/reset')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Reset provider health status (admin only)',
+    description:
+      'Clears accumulated health metrics for a provider, allowing it to recover from FAILED status. ' +
+      'Useful after manual recovery or to reset after a temporary outage.',
+  })
+  @ApiParam({ name: 'name', example: 'pinata', description: 'Provider name' })
+  @ApiResponse({ status: 200, description: 'Provider health reset successfully' })
+  @ApiResponse({ status: 401, description: 'Unauthorized — valid JWT required' })
+  @ApiResponse({ status: 403, description: 'Forbidden — admin privileges required' })
+  async resetProviderHealth(@Param('name') name: string) {
+    if (!this.providerHealth) {
+      return { error: 'Provider health service not available' };
+    }
+    await this.providerHealth.resetProviderHealth(name);
+    return { message: `Health metrics reset for provider: ${name}` };
   }
 }

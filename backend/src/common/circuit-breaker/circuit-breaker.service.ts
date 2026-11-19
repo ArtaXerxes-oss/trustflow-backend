@@ -9,6 +9,9 @@ export interface CircuitBreakerOptions {
   resetTimeout?: number;
   rollingCountTimeout?: number;
   rollingCountBuckets?: number;
+  /** Minimum number of requests in the rolling window before error % is evaluated at all
+   * (opossum defaults to 0, so a single failed call can trip the breaker). */
+  volumeThreshold?: number;
   fallback?: (error: Error) => Promise<unknown>;
 }
 
@@ -32,9 +35,13 @@ export class CircuitBreakerService {
       resetTimeout: options.resetTimeout ?? 30000,
       rollingCountTimeout: options.rollingCountTimeout ?? 10000,
       rollingCountBuckets: options.rollingCountBuckets ?? 10,
-      fallback: options.fallback,
+      volumeThreshold: options.volumeThreshold ?? 0,
       name,
     });
+
+    if (options.fallback) {
+      breaker.fallback(options.fallback);
+    }
 
     breaker.on('open', () => {
       this.logger.warn(`Circuit breaker "${name}" is now OPEN. Failing fast.`);
@@ -61,10 +68,10 @@ export class CircuitBreakerService {
       options,
     );
 
-    return (await breaker.fire()) as T;
+    return breaker.fire() as Promise<T>;
   }
 
-  getStatus(name: string): { state: string; stats: Record<string, unknown> } | null {
+  getStatus(name: string): { state: string; stats: Breaker.Stats } | null {
     const breaker = this.breakers.get(name);
     if (!breaker) return null;
 
@@ -74,8 +81,8 @@ export class CircuitBreakerService {
     };
   }
 
-  getAllStatus(): Record<string, { state: string; stats: Record<string, unknown> }> {
-    const result: Record<string, { state: string; stats: Record<string, unknown> }> = {};
+  getAllStatus(): Record<string, { state: string; stats: Breaker.Stats }> {
+    const result: Record<string, { state: string; stats: Breaker.Stats }> = {};
 
     for (const [name, breaker] of this.breakers.entries()) {
       result[name] = {

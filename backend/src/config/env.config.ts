@@ -79,11 +79,17 @@ const EnvSchema = z
       .string()
       .optional()
       .describe('Comma-separated list of Stellar addresses with admin access'),
+    // #991: base URL of the admin dashboard, used to build a direct per-escrow deep link
+    // ({ADMIN_DASHBOARD_URL}/escrows/{contractEscrowId}) in reconciliation drift alerts, so
+    // responders don't have to manually copy an escrow ID and navigate to it themselves.
+    ADMIN_DASHBOARD_URL: z
+      .preprocess(blankToUndefined, z.string().url().optional())
+      .describe('Base URL of the admin dashboard, used to build per-escrow deep links in alerts'),
 
     // Stellar Network Configuration
     STELLAR_NETWORK: z.enum(['TESTNET', 'PUBLIC', 'MAINNET']).default('TESTNET'),
-    STELLAR_HORIZON_URL: z.string().url().default('https://horizon-testnet.stellar.org'),
-    SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
+    STELLAR_HORIZON_URL: z.string().url().optional(),
+    SOROBAN_RPC_URL: z.string().url().optional(),
     TRUSTFLOW_CONTRACT_ID: z
       .string()
       .regex(/^C[A-Z2-7]{55}$/, 'TRUSTFLOW_CONTRACT_ID must be a valid Stellar contract address')
@@ -120,6 +126,23 @@ const EnvSchema = z
       .default(5000)
       .describe('Timeout (ms) for Stellar endpoint health checks'),
 
+    // Soroban RPC protocol version compatibility range (#980). The RPC node's reported
+    // `protocolVersion` (from `getNetwork()`) is checked against this range at startup and on
+    // every health check; a value outside it means the provider has upgraded past what this
+    // backend was tested against and response shapes may have silently changed underneath it.
+    SOROBAN_PROTOCOL_MIN_VERSION: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(20)
+      .describe('Lowest Soroban RPC protocol version this backend is tested against'),
+    SOROBAN_PROTOCOL_MAX_VERSION: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(22)
+      .describe('Highest Soroban RPC protocol version this backend is tested against'),
+
     // Redis Configuration
     REDIS_URL: z
       .string()
@@ -142,6 +165,14 @@ const EnvSchema = z
     DATABASE_URL: z
       .preprocess(blankToUndefined, z.string().url().optional())
       .describe('PostgreSQL connection string; currently optional infrastructure'),
+    DATABASE_READ_REPLICAS: z
+      .string()
+      .optional()
+      .describe(
+        'Comma-separated list of read-replica connection strings. ' +
+          'When set, DatabaseService routes read-only queries (queryRead) to replicas ' +
+          'in a round-robin fashion and all writes to the primary pool.',
+      ),
 
     // Monitoring & Observability
     DB_HOST: optionalString(),
@@ -157,6 +188,22 @@ const EnvSchema = z
     DB_POOL_MAX: optionalPositiveInt(),
     DB_POOL_IDLE_TIMEOUT_MS: optionalPositiveInt(),
     DB_POOL_CONNECTION_TIMEOUT_MS: optionalPositiveInt(),
+    DB_RETRY_ATTEMPTS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(5)
+      .describe(
+        'Maximum number of connection retry attempts during pool initialization. Default 5.',
+      ),
+    DB_RETRY_BACKOFF_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(1000)
+      .describe(
+        'Base delay in milliseconds for exponential backoff between connection retries. Default 1000ms.',
+      ),
 
     SWAGGER_ENABLED: optionalBool().describe(
       'Serve Swagger UI and the OpenAPI JSON; defaults to true outside production, false in production',
@@ -167,7 +214,35 @@ const EnvSchema = z
     SENTRY_DSN: z
       .preprocess(blankToUndefined, z.string().url().optional())
       .describe('Sentry error tracking DSN; errors are logged but not reported when unset'),
+    SENTRY_TRACES_SAMPLE_RATE: z
+      .preprocess(blankToUndefined, z.coerce.number().min(0).max(1).optional())
+      .describe(
+        'Sentry traces sample rate (0.0 to 1.0). Defaults to 0.2 in production, 1.0 otherwise (#934).',
+      ),
     APP_RELEASE: optionalString(),
+
+    // OpenTelemetry Configuration
+    OTEL_ENABLED: optionalBool().describe(
+      'Set to "true" to enable OpenTelemetry auto-instrumentation. Defaults to false.',
+    ),
+    OTEL_SERVICE_NAME: optionalString().describe(
+      'Service name reported in traces. Defaults to "trustflow-backend".',
+    ),
+    OTEL_EXPORTER_OTLP_ENDPOINT: z
+      .preprocess(blankToUndefined, z.string().url().optional())
+      .describe(
+        'OTLP gRPC/HTTP endpoint for the trace exporter ' +
+          '(e.g. http://otel-collector:4318). Required when OTEL_ENABLED=true.',
+      ),
+    OTEL_TRACES_SAMPLER_RATIO: z.coerce
+      .number()
+      .min(0)
+      .max(1)
+      .default(1)
+      .describe(
+        'Fraction of traces to sample (0.0–1.0). ' +
+          '1.0 = sample everything (default), 0.1 = 10 % of traces.',
+      ),
 
     // Discord Integration
     DISCORD_WEBHOOK_URL: z
@@ -186,10 +261,59 @@ const EnvSchema = z
       .default(1000)
       .describe('Base delay (ms) for exponential backoff in Discord retry logic. Default 1s.'),
 
+    // Platform Balance Monitoring (#730)
+    STELLAR_PLATFORM_ADDRESS: z
+      .preprocess(
+        blankToUndefined,
+        z
+          .string()
+          .regex(/^G[A-Z2-7]{55}$/)
+          .optional(),
+      )
+      .describe('Platform Stellar account address to monitor balance (G... format)'),
+    STELLAR_LOW_BALANCE_THRESHOLD: z.coerce
+      .number()
+      .positive()
+      .default(1)
+      .describe(
+        'Balance threshold (XLM) below which a low-balance warning is triggered. Default 1 XLM.',
+      ),
+    STELLAR_CRITICAL_BALANCE_THRESHOLD: z.coerce
+      .number()
+      .positive()
+      .default(0.5)
+      .describe(
+        'Balance threshold (XLM) below which a critical alert is triggered. Default 0.5 XLM.',
+      ),
+
     // Rate Limiting Configuration
     RATE_LIMIT_ABUSE_WINDOW_SECONDS: z.coerce.number().int().positive().default(300),
     RATE_LIMIT_ABUSE_THRESHOLD: z.coerce.number().int().positive().default(5),
     RATE_LIMIT_LOCKOUT_SECONDS: z.coerce.number().int().positive().default(900),
+    // Auth-route limits (#369): stricter than the global 100/60s default, per IP.
+    AUTH_CHALLENGE_RATE_LIMIT_POINTS: z.coerce.number().int().positive().default(10),
+    AUTH_CHALLENGE_RATE_LIMIT_DURATION: z.coerce.number().int().positive().default(60),
+    AUTH_VERIFY_RATE_LIMIT_POINTS: z.coerce.number().int().positive().default(10),
+    AUTH_VERIFY_RATE_LIMIT_DURATION: z.coerce.number().int().positive().default(60),
+    // Per-wallet-address limit on /auth/challenge (#993): the IP limit above is keyed on the
+    // caller's IP, so a script spread across many IPs/proxies can still mint unlimited pending
+    // challenges for one target wallet. This is keyed on the `address` query param itself,
+    // independent of IP, and is stricter/longer-windowed than the per-IP limit.
+    AUTH_CHALLENGE_WALLET_RATE_LIMIT_POINTS: z.coerce.number().int().positive().default(5),
+    AUTH_CHALLENGE_WALLET_RATE_LIMIT_DURATION: z.coerce.number().int().positive().default(300),
+    TRUST_PROXY: z.preprocess(
+      blankToUndefined,
+      z
+        .string()
+        .default('false')
+        .describe(
+          "Express 'trust proxy' setting: 'false' (direct exposure), 'true', a hop count such as '1' (one load balancer), or a comma-separated list of proxy IPs/CIDRs. Needed behind a load balancer so request.ip is the client, not the proxy.",
+        ),
+    ),
+
+    // WebSocket gateway (#393)
+    WS_MAX_ROOMS_PER_CLIENT: z.coerce.number().int().positive().default(50),
+
     RATE_LIMIT_ON_REDIS_ERROR: z.preprocess(
       blankToUndefined,
       z
@@ -205,9 +329,44 @@ const EnvSchema = z
     ESCROW_RECONCILIATION_SWEEP_CONCURRENCY: optionalPositiveInt(),
     ESCROW_RECONCILIATION_SWEEP_INTERVAL_MS: optionalNonnegativeInt(),
     RUN_MIGRATIONS_ON_STARTUP: optionalBool(),
+    MIGRATION_RUN_TTL_SECONDS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(30 * 24 * 60 * 60)
+      .describe(
+        'TTL (time-to-live) for completed/failed migration run records in Redis. Default 30 days.',
+      ),
+    MIGRATION_MAX_RUNS_PER_NAME: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(50)
+      .describe(
+        'Maximum number of run records to retain per migration name, even within the TTL window. Default 50.',
+      ),
+    NOTIFICATION_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(10_000)
+      .describe(
+        'Timeout (ms) for outbound email/push notification requests before the attempt is ' +
+          'aborted and classified as a retryable transient failure (#975). Default 10s.',
+      ),
     WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
     WEBHOOK_RELAY_BATCH_SIZE: z.coerce.number().int().positive().default(50),
     WEBHOOK_RELAY_LEASE_MS: z.coerce.number().int().positive().default(30_000),
+    WEBHOOK_PROCESSOR_CONCURRENCY: z.coerce.number().int().positive().default(10),
+    WEBHOOK_SECRET_ROTATION_GRACE_MS: z.coerce
+      .number()
+      .int()
+      .nonnegative()
+      .default(24 * 60 * 60 * 1000)
+      .describe(
+        "How long a webhook subscription's previous signing secret stays accepted " +
+          '(dual-signed alongside the new one) after a secret rotation (#984). Default 24 hours.',
+      ),
     OUTBOX_RELAY_INTERVAL_MS: z.coerce.number().int().nonnegative().default(1000),
     OUTBOX_RELAY_BATCH_SIZE: z.coerce.number().int().positive().default(100),
     OUTBOX_RELAY_LEASE_MS: z.coerce.number().int().positive().default(30_000),
@@ -232,6 +391,38 @@ const EnvSchema = z
     INFURA_IPFS_PROJECT_SECRET: z.string().optional().describe('Infura IPFS project secret'),
     IPFS_REPIN_SWEEP_CONCURRENCY: z.coerce.number().int().positive().default(8),
     IPFS_REPIN_INTERVAL_MS: optionalNonnegativeInt(),
+    IPFS_PROVIDER_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+    IPFS_PROVIDER_HEALTH_CHECK_INTERVAL_MS: optionalNonnegativeInt(),
+
+    // S3-compatible Storage Configuration (avatar uploads)
+    S3_BUCKET: z
+      .preprocess(blankToUndefined, z.string().optional())
+      .describe('S3 bucket name for avatar uploads. Required in production.'),
+    S3_REGION: z
+      .preprocess(blankToUndefined, z.string().optional())
+      .describe('AWS region (or equivalent) for the S3 bucket.'),
+    S3_ACCESS_KEY_ID: z
+      .preprocess(blankToUndefined, z.string().optional())
+      .describe('AWS / S3-compatible access key ID.'),
+    S3_SECRET_ACCESS_KEY: z
+      .preprocess(blankToUndefined, z.string().optional())
+      .describe('AWS / S3-compatible secret access key.'),
+    S3_ENDPOINT: z
+      .preprocess(blankToUndefined, z.string().url().optional())
+      .describe(
+        'Custom S3-compatible endpoint URL (e.g. MinIO, Cloudflare R2). ' +
+          'Leave unset to use the standard AWS endpoint.',
+      ),
+    S3_PUBLIC_URL_BASE: z
+      .preprocess(blankToUndefined, z.string().url().optional())
+      .describe(
+        'Base URL for public object access (e.g. CDN prefix). ' +
+          'When set, returned avatar URLs use this prefix instead of the signed URL.',
+      ),
+
+    // Arweave Configuration
+    ARWEAVE_JWT: z.string().optional().describe('Arweave wallet key in JWK format'),
+    ARWEAVE_UPLOAD_URL: z.string().url().optional().describe('Arweave upload endpoint URL'),
 
     // Reputation System Configuration
     REPUTATION_DECAY_HALF_LIFE_MS: z.coerce.number().int().positive().optional(),
@@ -290,8 +481,23 @@ const EnvSchema = z
         'disabling PostgreSQL certificate verification is not allowed in production',
       );
     }
+    if (data.SOROBAN_PROTOCOL_MIN_VERSION > data.SOROBAN_PROTOCOL_MAX_VERSION) {
+      issue(
+        'SOROBAN_PROTOCOL_MIN_VERSION',
+        'SOROBAN_PROTOCOL_MIN_VERSION must not be greater than SOROBAN_PROTOCOL_MAX_VERSION',
+      );
+    }
+
     if (Boolean(data.SWAGGER_USER) !== Boolean(data.SWAGGER_PASSWORD)) {
       issue('SWAGGER_USER', 'SWAGGER_USER and SWAGGER_PASSWORD must be set together');
+    }
+
+    // Cross-field sanity check for rate limit abuse detection (#921)
+    if (data.RATE_LIMIT_ABUSE_THRESHOLD > data.RATE_LIMIT_ABUSE_WINDOW_SECONDS * 10) {
+      issue(
+        'RATE_LIMIT_ABUSE_THRESHOLD',
+        `RATE_LIMIT_ABUSE_THRESHOLD (${data.RATE_LIMIT_ABUSE_THRESHOLD}) is unreasonably high for RATE_LIMIT_ABUSE_WINDOW_SECONDS (${data.RATE_LIMIT_ABUSE_WINDOW_SECONDS}s); threshold cannot be realistically reached within the window`,
+      );
     }
     const swaggerEnabled = data.SWAGGER_ENABLED
       ? data.SWAGGER_ENABLED === 'true'
@@ -319,6 +525,10 @@ const EnvSchema = z
           'CORS_ORIGIN',
           'CORS_ORIGIN must be explicitly set to a comma-separated list of allowed origins in production; wildcard is not allowed',
         );
+      }
+
+      if (!data.SOROBAN_RPC_URL || data.SOROBAN_RPC_URL.trim() === '') {
+        issue('SOROBAN_RPC_URL', 'SOROBAN_RPC_URL is required in production');
       }
     }
 
@@ -353,17 +563,43 @@ const EnvSchema = z
       issue('JWT_SECRET_PREVIOUS', 'JWT_SECRET_PREVIOUS must differ from JWT_SECRET');
     }
 
+    // Apply network-appropriate defaults for Stellar RPC URLs if not explicitly provided
+    if (!data.STELLAR_HORIZON_URL) {
+      data.STELLAR_HORIZON_URL = isPublicNetwork
+        ? 'https://horizon.stellar.org'
+        : 'https://horizon-testnet.stellar.org';
+    }
+    if (!data.SOROBAN_RPC_URL && !isProduction) {
+      data.SOROBAN_RPC_URL = isPublicNetwork
+        ? 'https://soroban-mainnet.stellar.org'
+        : 'https://soroban-testnet.stellar.org';
+    }
+
+    // Validate that URLs match the selected network after defaults are applied
     if (isPublicNetwork) {
-      if (!data.STELLAR_HORIZON_URL || /testnet/i.test(data.STELLAR_HORIZON_URL)) {
+      if (/testnet/i.test(data.STELLAR_HORIZON_URL)) {
         issue(
           'STELLAR_HORIZON_URL',
           'STELLAR_HORIZON_URL must point to the PUBLIC network when STELLAR_NETWORK is PUBLIC or MAINNET',
         );
       }
-      if (!data.SOROBAN_RPC_URL || /testnet/i.test(data.SOROBAN_RPC_URL)) {
+      if (/testnet/i.test(data.SOROBAN_RPC_URL ?? '')) {
         issue(
           'SOROBAN_RPC_URL',
           'SOROBAN_RPC_URL must point to the PUBLIC network when STELLAR_NETWORK is PUBLIC or MAINNET',
+        );
+      }
+    } else {
+      if (/mainnet|public/i.test(data.STELLAR_HORIZON_URL)) {
+        issue(
+          'STELLAR_HORIZON_URL',
+          'STELLAR_HORIZON_URL must point to the TESTNET when STELLAR_NETWORK is TESTNET',
+        );
+      }
+      if (/mainnet|public/i.test(data.SOROBAN_RPC_URL ?? '')) {
+        issue(
+          'SOROBAN_RPC_URL',
+          'SOROBAN_RPC_URL must point to the TESTNET when STELLAR_NETWORK is TESTNET',
         );
       }
     }

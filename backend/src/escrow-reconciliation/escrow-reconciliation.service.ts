@@ -64,8 +64,9 @@ export class EscrowReconciliationService {
     const drifts: DriftRecord[] = [];
     const errors: ReconciliationError[] = [];
 
-    const dbEscrows = await this.escrowService.findAll();
-    const linked = dbEscrows.filter(e => e.contractEscrowId);
+    const all = await this.escrowService.findAll();
+    const linked = all.filter(e => e.contractEscrowId);
+
     const knownIds = new Set(linked.map(e => e.contractEscrowId as string));
 
     const targets: ReconciliationTarget[] = [
@@ -77,10 +78,14 @@ export class EscrowReconciliationService {
         .filter(contractEscrowId => !knownIds.has(contractEscrowId))
         .map(contractEscrowId => ({ contractEscrowId })),
     ];
+
+    // Limit parallel reconciliation queries to maximum 3 concurrent connections as per #657
+    const reconcileConcurrency = Math.min(this.getReadConcurrency(), 3);
+    
     // One bounded-concurrency read per target. `mapWithConcurrency` never rejects, so an
     // unexpected read failure comes back as a `rejected` result and is recorded against that
     // escrow below rather than aborting the whole sweep.
-    const chainReads = await mapWithConcurrency(targets, this.getReadConcurrency(), target =>
+    const chainReads = await mapWithConcurrency(targets, reconcileConcurrency, target =>
       this.fetchChainEscrow(target.contractEscrowId),
     );
 
@@ -231,7 +236,14 @@ export class EscrowReconciliationService {
       chainValue,
       repaired: false,
       detectedAt: new Date().toISOString(),
+      adminUrl: this.buildEscrowAdminUrl(contractEscrowId),
     };
+  }
+
+  /** Builds a direct admin-dashboard deep link for `contractEscrowId` (#991), or `undefined` when `ADMIN_DASHBOARD_URL` isn't configured. */
+  private buildEscrowAdminUrl(contractEscrowId: string): string | undefined {
+    if (!config.ADMIN_DASHBOARD_URL) return undefined;
+    return `${config.ADMIN_DASHBOARD_URL.replace(/\/+$/, '')}/escrows/${encodeURIComponent(contractEscrowId)}`;
   }
 
   /**

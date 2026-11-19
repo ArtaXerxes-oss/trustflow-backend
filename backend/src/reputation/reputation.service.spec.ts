@@ -73,6 +73,23 @@ describe('ReputationService', () => {
       expect(Number.isFinite(view.score)).toBe(true);
     });
 
+    it('still differentiates two ordinary-but-different gig budgets instead of both hitting the cap (#977)', async () => {
+      // Under the old sqrt(amountXLM) cap (10, reached at 100 XLM), both of these — a modest
+      // gig and one 500x larger — saturated identically and contributed the exact same
+      // amount to score, defeating the point of budget-weighting for most real gigs.
+      const modestStore = new ReputationScoreStore();
+      const modestService = new ReputationService(modestStore);
+      await modestService.recordEscrowCompleted(makeEscrow({ amountXLM: '100' }));
+      const modest = (await modestService.getScore('GDEPOSITOR')).score;
+
+      const largeStore = new ReputationScoreStore();
+      const largeService = new ReputationService(largeStore);
+      await largeService.recordEscrowCompleted(makeEscrow({ amountXLM: '50000' }));
+      const large = (await largeService.getScore('GDEPOSITOR')).score;
+
+      expect(large).toBeGreaterThan(modest);
+    });
+
     it('gives a negative amount no contribution', async () => {
       await service.recordEscrowCompleted(makeEscrow({ amountXLM: '-50' }));
       expect((await service.getScore('GDEPOSITOR')).score).toBe(0);
@@ -250,18 +267,19 @@ describe('ReputationService', () => {
 
     describe('deterministic tie-breaking', () => {
       it('breaks a score tie by eventCount descending', async () => {
-        // GONE: a single amount-36 event (weight 6, dampening 1) -> 5*6*1 = 30.
-        // GTWO: two amount-16 events with the *same* counterparty (weight 4 each,
-        // dampening 1 then 1/2) -> 5*4*1 + 5*4*0.5 = 30. Same total score, but GTWO
-        // has twice the eventCount.
+        // GONE: a single amount-100 event (amountWeight 1+log10(100)=3, dampening 1)
+        // -> 5*3*1 = 15.
+        // GTWO: two amount-10 events with the *same* counterparty (amountWeight
+        // 1+log10(10)=2 each, dampening 1 then 1/2) -> 5*2*1 + 5*2*0.5 = 15. Same
+        // total score, but GTWO has twice the eventCount.
         await service.recordEscrowCompleted(
-          makeEscrow({ depositor: 'GONE', beneficiary: 'GBENX', amountXLM: '36' }),
+          makeEscrow({ depositor: 'GONE', beneficiary: 'GBENX', amountXLM: '100' }),
         );
         await service.recordEscrowCompleted(
-          makeEscrow({ depositor: 'GTWO', beneficiary: 'GBENY', amountXLM: '16' }),
+          makeEscrow({ depositor: 'GTWO', beneficiary: 'GBENY', amountXLM: '10' }),
         );
         await service.recordEscrowCompleted(
-          makeEscrow({ depositor: 'GTWO', beneficiary: 'GBENY', amountXLM: '16' }),
+          makeEscrow({ depositor: 'GTWO', beneficiary: 'GBENY', amountXLM: '10' }),
         );
 
         const gOne = await service.getScore('GONE');
@@ -305,8 +323,9 @@ describe('ReputationService', () => {
       expect(view.distinctCounterparties).toBe(counterparties.length);
 
       // Every counterparty was distinct and one-off, so every contribution was undampened.
+      // amountWeight for the default 100 XLM escrow is 1 + log10(100) = 3.
       const expectedScore =
-        counterparties.length * REPUTATION_WEIGHTS[ReputationEventType.ESCROW_COMPLETED] * 10;
+        counterparties.length * REPUTATION_WEIGHTS[ReputationEventType.ESCROW_COMPLETED] * 3;
       expect(view.score).toBeCloseTo(expectedScore, 5);
     });
 
@@ -319,7 +338,8 @@ describe('ReputationService', () => {
       const view = await service.getScore('GDEPOSITOR');
       expect(view.eventCount).toBe(5);
 
-      const perEventWeight = REPUTATION_WEIGHTS[ReputationEventType.ESCROW_COMPLETED] * 10;
+      // amountWeight for the default 100 XLM escrow is 1 + log10(100) = 3.
+      const perEventWeight = REPUTATION_WEIGHTS[ReputationEventType.ESCROW_COMPLETED] * 3;
       const harmonicSum = 1 + 1 / 2 + 1 / 3 + 1 / 4 + 1 / 5;
       // getScore() rounds to 2 decimal places, so compare at that precision.
       expect(view.score).toBeCloseTo(perEventWeight * harmonicSum, 2);
@@ -363,6 +383,71 @@ describe('ReputationService', () => {
       expect(view.recentEvents[0].counterparty).toBe(`GBEN${totalEvents - 1}`);
       expect(view.recentEvents.map(e => e.counterparty)).not.toContain('GBEN0');
       expect(view.recentEvents.map(e => e.counterparty)).not.toContain('GBEN4');
+    });
+  });
+
+  describe('getScoreBreakdown (#989)', () => {
+    it('itemizes each event with its base weight, amount weight, and dampening factor', async () => {
+      await service.recordEscrowCompleted(makeEscrow());
+
+      const breakdown = await service.getScoreBreakdown('GDEPOSITOR');
+
+      expect(breakdown.address).toBe('GDEPOSITOR');
+      expect(breakdown.events).toHaveLength(1);
+      expect(breakdown.events[0]).toMatchObject({
+        type: 'escrow_completed',
+        counterparty: 'GBENEFICIARY',
+        baseWeight: REPUTATION_WEIGHTS[ReputationEventType.ESCROW_COMPLETED],
+        dampeningFactor: 1,
+      });
+      expect(breakdown.events[0].amountWeight).toBeGreaterThan(0);
+      expect(breakdown.events[0].amountWeight).toBeLessThanOrEqual(REPUTATION_MAX_AMOUNT_WEIGHT);
+      // baseWeight * amountWeight * dampeningFactor reconstructs the stored contribution.
+      expect(
+        breakdown.events[0].baseWeight *
+          breakdown.events[0].amountWeight *
+          breakdown.events[0].dampeningFactor,
+      ).toBeCloseTo(breakdown.events[0].contribution, 6);
+    });
+
+    it('matches the current score from getScore', async () => {
+      await service.recordEscrowCompleted(makeEscrow());
+
+      const [view, breakdown] = await Promise.all([
+        service.getScore('GDEPOSITOR'),
+        service.getScoreBreakdown('GDEPOSITOR'),
+      ]);
+
+      expect(breakdown.score).toBe(view.score);
+      expect(breakdown.eventCount).toBe(view.eventCount);
+    });
+
+    it("decays a long-past event's contribution toward zero in decayedContribution", async () => {
+      await service.recordEscrowCompleted(makeEscrow());
+
+      // Backdate the event by one half-life, bypassing the service so this test doesn't
+      // depend on mocking Date (new Date() isn't reliably affected by mocking Date.now).
+      const record = (await store.get('GDEPOSITOR'))!;
+      const backdated = new Date(
+        new Date(record.recentEvents[0].occurredAt).getTime() - REPUTATION_DECAY_HALF_LIFE_MS,
+      ).toISOString();
+      record.recentEvents[0].occurredAt = backdated;
+      await store.save(record);
+
+      const breakdown = await service.getScoreBreakdown('GDEPOSITOR');
+
+      // One half-life has elapsed since the event, so its still-counted value should be
+      // roughly half of its original, undecayed contribution.
+      expect(breakdown.events[0].decayedContribution).toBeCloseTo(
+        breakdown.events[0].contribution * 0.5,
+        1,
+      );
+    });
+
+    it('returns an empty breakdown for an address with no history', async () => {
+      const breakdown = await service.getScoreBreakdown('GNEW');
+
+      expect(breakdown).toMatchObject({ address: 'GNEW', score: 0, eventCount: 0, events: [] });
     });
   });
 });

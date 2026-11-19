@@ -23,13 +23,13 @@ import { SKIP_TIMEOUT_KEY } from './skip-timeout.decorator';
  *
  * Note: rxjs timeout ends the response but does not cancel the running handler;
  * handlers should use AbortController or similar to cancel downstream work.
- * Exempt routes: /health*, /metrics, /api/docs*, /api-json.
+ * Exempt routes: /health*, /metrics, /api/docs*, /api/docs-json.
  */
 @Injectable()
 export class RequestTimeoutInterceptor implements NestInterceptor {
   private readonly logger = new SanitizedLogger(RequestTimeoutInterceptor.name);
   private readonly defaultTimeoutMs = config.REQUEST_TIMEOUT_MS;
-  private readonly exemptPaths = ['/health', '/metrics', '/api/docs', '/api-docs-json'];
+  private readonly exemptPaths = ['/health', '/metrics', '/api/docs', '/api/docs-json'];
 
   constructor(private readonly reflector: Reflector) {}
 

@@ -1,4 +1,4 @@
-import { Inject, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, OnModuleDestroy, OnModuleInit, BeforeApplicationShutdown, Optional } from '@nestjs/common';
 import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { rpc as SorobanRpc } from '@stellar/stellar-sdk';
 import { Redis } from 'ioredis';
@@ -6,6 +6,8 @@ import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { getStellarConfig } from '../stellar/stellar.config';
 import { config } from '../config/env.config';
 import { buildSorobanServer } from '../stellar/soroban.helper';
+import { SorobanMetricsService } from '../monitoring/soroban-metrics.service';
+import { wrapSorobanRpc } from '../monitoring/soroban-rpc-metrics.interceptor';
 
 export interface IndexedSorobanEvent {
   eventId: string;
@@ -25,16 +27,20 @@ const DEFAULT_EVENT_LIMIT = 50;
 const MAX_EVENT_LIMIT = 200;
 
 @Injectable()
-export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy {
+export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy, BeforeApplicationShutdown {
   private readonly logger = new SanitizedLogger(SorobanEventIndexerService.name);
   private rpcServer!: SorobanRpc.Server;
   private pollingInterval: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private currentPoll: Promise<IndexedSorobanEvent[]> | null = null;
 
   private readonly POLL_INTERVAL_MS = 10_000;
   private readonly MAX_LEDGER_RANGE = 100;
 
-  constructor(@Inject(REDIS_CLIENT) private readonly redis: Redis | null) {}
+  constructor(
+    @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
+    @Optional() private readonly sorobanMetrics?: SorobanMetricsService,
+  ) {}
 
   onModuleInit() {
     this.rpcServer = buildSorobanServer(getStellarConfig().sorobanRpcUrl);
@@ -49,10 +55,19 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
     this.isRunning = true;
 
     const run = async () => {
+      // Skip this tick if a previous poll is still in flight, so slow RPC calls
+      // never let two polls race on the same cursor.
+      if (this.currentPoll) {
+        this.logger.warn('Skipping Soroban poll: previous poll still in flight');
+        return;
+      }
       try {
-        await this.poll();
+        this.currentPoll = this.poll();
+        await this.currentPoll;
       } catch (err) {
         this.logger.error('Soroban event poll failed', err);
+      } finally {
+        this.currentPoll = null;
       }
     };
 
@@ -121,7 +136,11 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
       limit: 100,
     };
 
-    const response = (await this.rpcServer.getEvents(getEventsParams)) as any;
+    const response = (await (this.sorobanMetrics
+      ? wrapSorobanRpc(this.sorobanMetrics, 'getEvents', () =>
+          this.rpcServer.getEvents(getEventsParams),
+        )
+      : this.rpcServer.getEvents(getEventsParams))) as any;
 
     const events: IndexedSorobanEvent[] = [];
     for (const raw of response.events) {
@@ -142,6 +161,12 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
     // Only update cursor after ALL events in the batch are successfully stored
     // This ensures atomicity: if storage fails mid-batch, we'll re-process on next poll
     await this.setCursor(endLedger);
+
+    // Update the ledger lag gauge so Prometheus can alert when the indexer
+    // falls behind the chain tip.
+    if (this.sorobanMetrics) {
+      this.sorobanMetrics.setIndexerLedgerLag(currentLedger - endLedger);
+    }
 
     if (events.length > 0) {
       this.logger.log(`Indexed ${events.length} events from ledgers ${startLedger}-${endLedger}`);
@@ -195,6 +220,10 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
   private async setCursor(ledger: number): Promise<void> {
     if (!this.redis) return;
     try {
+      // Only ever advance the cursor. A stale write must never move it backward.
+      const raw = await this.redis.get(CURSOR_KEY);
+      const current = raw ? parseInt(raw, 10) : 0;
+      if (ledger <= current) return;
       await this.redis.set(CURSOR_KEY, ledger.toString());
     } catch {
       // best effort
@@ -203,7 +232,9 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
 
   private async getLedgerBounds(): Promise<{ latestLedger: number; oldestLedger: number }> {
     try {
-      const response = await this.rpcServer.getHealth();
+      const response = await (this.sorobanMetrics
+        ? wrapSorobanRpc(this.sorobanMetrics, 'getHealth', () => this.rpcServer.getHealth())
+        : this.rpcServer.getHealth());
       if (response && typeof response === 'object') {
         const anyResp = response as any;
         return {
@@ -242,6 +273,40 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
       return String(value);
     } catch {
       return String(value);
+    }
+  }
+
+  /**
+   * Gracefully handles shutdown by waiting for the current poll to complete.
+   * Called automatically by NestJS when SIGTERM/SIGINT is received.
+   * Waits up to 15 seconds for the active poll before allowing termination.
+   */
+  async beforeApplicationShutdown(signal?: string): Promise<void> {
+    this.logger.log(`Soroban indexer received shutdown signal: ${signal || 'unknown'}`);
+    
+    // Stop accepting new polls
+    this.stop();
+
+    if (!this.currentPoll) {
+      this.logger.log('Soroban indexer shutdown - no active poll');
+      return;
+    }
+
+    this.logger.log('Soroban indexer waiting for current poll to complete');
+    
+    const shutdownTimeout = 15000; // 15 seconds
+    const timeoutPromise = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        this.logger.warn('Soroban indexer shutdown timeout reached - current poll may be incomplete');
+        resolve();
+      }, shutdownTimeout);
+    });
+
+    try {
+      await Promise.race([this.currentPoll, timeoutPromise]);
+      this.logger.log('Soroban indexer shutdown complete');
+    } catch (error) {
+      this.logger.error('Error during Soroban indexer shutdown', error);
     }
   }
 }

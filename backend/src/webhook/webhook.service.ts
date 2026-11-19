@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, BeforeApplicationShutdown } from '@nestjs/common';
 import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { redactUrl } from '../common/logging/redaction';
 import * as https from 'https';
@@ -14,10 +14,19 @@ import { config } from '../config/env.config';
 /** Base backoff between webhook delivery attempts; grows linearly per attempt. */
 const WEBHOOK_RETRY_BASE_DELAY_MS = 1000;
 
+/**
+ * Current payload schema version (#983). Bump this whenever a breaking change
+ * is made to the payload shape for any event, and keep delivering the previous
+ * shape to subscribers who have not yet migrated.
+ */
+export const CURRENT_WEBHOOK_SCHEMA_VERSION = 1;
+
 interface WebhookPayload {
   event: string;
   data: unknown;
   timestamp: string;
+  /** Payload schema version, so subscribers can detect and handle future shape changes. */
+  schemaVersion: number;
   /** Stable key consumers use to collapse retries from the transactional outbox. */
   dedupKey?: string;
 }
@@ -29,9 +38,34 @@ export interface WebhookEndpointConfig {
 
 /**
  * Computes an HMAC-SHA256 hex signature for a given payload body string and secret.
+ *
+ * Signature format: `t=<unix_ms>,v1=<hex_hmac>`
+ *
+ * The signed content is `<timestamp>.<payloadBody>` — binding the timestamp into
+ * the MAC prevents replay attacks: a receiver that rejects events older than N
+ * seconds will refuse a stolen payload even if the attacker re-sends it later.
+ *
+ * @param payloadBody - Raw JSON body string of the webhook payload
+ * @param secret      - Endpoint signing secret (min 16 chars, hex or arbitrary)
+ * @param timestampMs - Unix epoch milliseconds; defaults to Date.now()
+ * @returns           - Signature header value ready to set on `X-TrustFlow-Signature`
  */
-export function computeWebhookSignature(payloadBody: string, secret: string): string {
-  return crypto.createHmac('sha256', secret).update(payloadBody, 'utf8').digest('hex');
+export function computeWebhookSignature(
+  payloadBody: string,
+  secret: string,
+  timestampMs: number = Date.now(),
+): string {
+  const signedContent = `${timestampMs}.${payloadBody}`;
+  const hmac = crypto.createHmac('sha256', secret).update(signedContent, 'utf8').digest('hex');
+  return `t=${timestampMs},v1=${hmac}`;
+}
+
+/**
+ * Generates a cryptographically random webhook signing secret (32 bytes → 64 hex chars).
+ * Used when the caller does not supply their own secret at registration time.
+ */
+export function generateWebhookSecret(): string {
+  return crypto.randomBytes(32).toString('hex');
 }
 
 /**
@@ -172,18 +206,36 @@ export async function validateWebhookUrl(urlString: string): Promise<void> {
 }
 
 @Injectable()
-export class WebhookService {
+export class WebhookService implements BeforeApplicationShutdown {
   private readonly logger = new SanitizedLogger(WebhookService.name);
   private endpoints = new Map<string, WebhookEndpointConfig>();
+  private inFlightRequests = new Set<Promise<void>>();
+  private isShuttingDown = false;
 
   constructor(
     @Inject(forwardRef(() => OutboxService)) private readonly outboxService: OutboxService,
   ) {}
 
-  async register(id: string, url: string, secret?: string) {
+  /**
+   * Registers a webhook endpoint and ensures it has a signing secret.
+   *
+   * If the caller supplies a `secret` it is used as-is (must be ≥ 16 chars,
+   * enforced by `RegisterWebhookSchema`). When no secret is provided one is
+   * generated with `generateWebhookSecret()` — 32 random bytes encoded as hex.
+   *
+   * The secret is returned in the registration response so the caller can store
+   * it; it is never exposed again after this call.
+   *
+   * @returns The (potentially auto-generated) signing secret so the caller can
+   *          configure their receiver.
+   */
+  async register(id: string, url: string, secret?: string): Promise<string> {
     await validateWebhookUrl(url);
-    this.endpoints.set(id, { url, secret });
+    const signingSecret = secret ?? generateWebhookSecret();
+    this.endpoints.set(id, { url, secret: signingSecret });
+    return signingSecret;
   }
+
   unregister(id: string) {
     this.endpoints.delete(id);
   }
@@ -193,7 +245,18 @@ export class WebhookService {
   }
 
   async deliver(event: string, data: unknown, dedupKey?: string) {
-    const payload: WebhookPayload = { event, data, timestamp: new Date().toISOString(), dedupKey };
+    if (this.isShuttingDown) {
+      this.logger.warn('Webhook service is shutting down, rejecting new delivery');
+      return;
+    }
+
+    const payload: WebhookPayload = {
+      event,
+      data,
+      timestamp: new Date().toISOString(),
+      schemaVersion: CURRENT_WEBHOOK_SCHEMA_VERSION,
+      dedupKey,
+    };
     // Re-validate each endpoint at dispatch time to protect against DNS rebinding
     const validEndpoints: WebhookEndpointConfig[] = [];
     for (const endpoint of this.endpoints.values()) {
@@ -213,11 +276,21 @@ export class WebhookService {
     const promises = validEndpoints.map(endpoint =>
       this.sendWithRetry(endpoint.url, payload, 3, endpoint.secret),
     );
-    const results = await Promise.allSettled(promises);
-    const failed = results.find(
-      (result): result is PromiseRejectedResult => result.status === 'rejected',
-    );
-    if (failed) throw failed.reason;
+    
+    // Track in-flight webhook requests for graceful shutdown
+    const deliveryPromise = Promise.allSettled(promises).then(results => {
+      const failed = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      if (failed) throw failed.reason;
+    });
+    
+    this.inFlightRequests.add(deliveryPromise);
+    try {
+      await deliveryPromise;
+    } finally {
+      this.inFlightRequests.delete(deliveryPromise);
+    }
   }
 
   private sendWithRetry(
@@ -246,7 +319,9 @@ export class WebhookService {
         'Content-Length': Buffer.byteLength(body, 'utf8'),
       };
       if (secret) {
-        headers['X-TrustFlow-Signature'] = computeWebhookSignature(body, secret);
+        // Bind the current timestamp into the signature to enable replay-attack
+        // prevention on the receiver side (reject events older than ~5 minutes).
+        headers['X-TrustFlow-Signature'] = computeWebhookSignature(body, secret, Date.now());
       }
 
       const req = mod.request(
@@ -267,5 +342,42 @@ export class WebhookService {
       req.write(body);
       req.end();
     });
+  }
+
+  /**
+   * Gracefully handles shutdown by waiting for all in-flight webhook deliveries to complete.
+   * Called automatically by NestJS when SIGTERM/SIGINT is received.
+   * Waits up to 15 seconds for pending requests before allowing the process to terminate.
+   */
+  async beforeApplicationShutdown(signal?: string): Promise<void> {
+    this.isShuttingDown = true;
+    const count = this.inFlightRequests.size;
+    
+    if (count === 0) {
+      this.logger.log('Webhook service shutdown - no in-flight requests');
+      return;
+    }
+
+    this.logger.log(`Webhook service shutting down - waiting for ${count} in-flight request(s)`);
+    
+    const shutdownTimeout = 15000; // 15 seconds
+    const timeoutPromise = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        this.logger.warn(
+          `Webhook shutdown timeout reached - ${this.inFlightRequests.size} request(s) still pending`
+        );
+        resolve();
+      }, shutdownTimeout);
+    });
+
+    try {
+      await Promise.race([
+        Promise.allSettled(Array.from(this.inFlightRequests)),
+        timeoutPromise,
+      ]);
+      this.logger.log('Webhook service shutdown complete');
+    } catch (error) {
+      this.logger.error('Error during webhook service shutdown', error);
+    }
   }
 }

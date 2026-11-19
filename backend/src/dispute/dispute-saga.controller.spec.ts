@@ -1,8 +1,14 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { DisputeSagaController } from './dispute-saga.controller';
 import { DisputeSagaService } from './dispute-saga.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
+import { validateEnv } from '../config/env.config';
+
+// DisputeSagaController is guarded by AdminGuard, which reads config.ADMIN_ADDRESSES in its
+// constructor — Nest instantiates guards during compile(), so validateEnv() must have
+// already run — normally done once in main.ts.
+validateEnv();
 
 // ─── Shared fixtures ──────────────────────────────────────────────────────────
 
@@ -260,31 +266,51 @@ describe('DisputeSagaController', () => {
   // ─── POST /:sagaId/vote ───────────────────────────────────────────────────
 
   describe('castVote()', () => {
-    it('passes sagaId and dto to sagaService.castVote() and returns the result', async () => {
+    const JUROR_REQ = {
+      user: { address: CAST_VOTE_DTO.jurorAddress, sub: 'j1' },
+    };
+
+    it('passes sagaId, dto, and req.user.address to sagaService.castVote() and returns the result', async () => {
       const updatedSaga = {
         ...FAKE_SAGA,
         votes: [{ jurorAddress: CAST_VOTE_DTO.jurorAddress, vote: 'depositor' }],
       };
       mockSagaService.castVote.mockResolvedValue(updatedSaga);
 
-      const result = await controller.castVote(SAGA_ID, CAST_VOTE_DTO);
+      const result = await controller.castVote(SAGA_ID, CAST_VOTE_DTO, JUROR_REQ as any);
 
-      expect(mockSagaService.castVote).toHaveBeenCalledWith(SAGA_ID, CAST_VOTE_DTO);
+      expect(mockSagaService.castVote).toHaveBeenCalledWith(
+        SAGA_ID,
+        CAST_VOTE_DTO,
+        JUROR_REQ.user.address,
+      );
       expect(result).toEqual(updatedSaga);
+    });
+
+    it('propagates ForbiddenException when caller wallet does not match jurorAddress', async () => {
+      mockSagaService.castVote.mockRejectedValue(
+        new ForbiddenException('Authenticated wallet does not match juror address'),
+      );
+
+      await expect(
+        controller.castVote(SAGA_ID, CAST_VOTE_DTO, REQ as any),
+      ).rejects.toThrow(ForbiddenException);
     });
 
     it('propagates BadRequestException for a non-assigned juror', async () => {
       mockSagaService.castVote.mockRejectedValue(new BadRequestException('Juror not assigned'));
 
-      await expect(controller.castVote(SAGA_ID, CAST_VOTE_DTO)).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(
+        controller.castVote(SAGA_ID, CAST_VOTE_DTO, JUROR_REQ as any),
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('propagates ConflictException on a duplicate vote', async () => {
       mockSagaService.castVote.mockRejectedValue(new ConflictException('Juror has already voted'));
 
-      await expect(controller.castVote(SAGA_ID, CAST_VOTE_DTO)).rejects.toThrow(ConflictException);
+      await expect(
+        controller.castVote(SAGA_ID, CAST_VOTE_DTO, JUROR_REQ as any),
+      ).rejects.toThrow(ConflictException);
     });
   });
 

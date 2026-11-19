@@ -9,9 +9,9 @@ export class VerifyDto {
   @IsString()
   @IsNotEmpty()
   @Matches(/^G[A-Z0-9]{55}$/, {
-    message: 'Invalid Stellar public key format',
+    message: 'address must be a valid Stellar public key (G...)',
   })
-  address: string;
+  address!: string;
 
   @ApiProperty({
     description: 'Base64-encoded signature of the challenge message',
@@ -19,5 +19,5 @@ export class VerifyDto {
   })
   @IsString()
   @IsNotEmpty()
-  signature: string;
+  signature!: string;
 }

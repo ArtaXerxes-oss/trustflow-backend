@@ -1,3 +1,4 @@
+import { UnauthorizedException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
@@ -15,6 +16,7 @@ describe('AuthController', () => {
       generateChallenge: jest.fn().mockResolvedValue(TEST_CHALLENGE),
       verifySignature: jest.fn().mockResolvedValue(true),
       generateToken: jest.fn().mockReturnValue('mock-jwt-token'),
+      generateRefreshToken: jest.fn().mockResolvedValue('mock-refresh-token'),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -31,15 +33,12 @@ describe('AuthController', () => {
 
   describe('getChallenge', () => {
     it('should return a challenge for a valid address', async () => {
-      const result = await controller.getChallenge(TEST_ADDRESS);
+      const result = await controller.getChallenge({ address: TEST_ADDRESS });
 
       expect(result).toEqual({ challenge: TEST_CHALLENGE });
       expect(mockAuthService.generateChallenge).toHaveBeenCalledWith(TEST_ADDRESS);
     });
 
-    it('should throw when address is missing', async () => {
-      await expect(controller.getChallenge('')).rejects.toThrow('address required');
-    });
   });
 
   describe('verify', () => {
@@ -49,12 +48,13 @@ describe('AuthController', () => {
         signature: 'SGVsbG8gV29ybGQh',
       });
 
-      expect(result).toEqual({ token: 'mock-jwt-token' });
+      expect(result).toEqual({ token: 'mock-jwt-token', refreshToken: 'mock-refresh-token' });
       expect(mockAuthService.verifySignature).toHaveBeenCalledWith(
         TEST_ADDRESS,
         'SGVsbG8gV29ybGQh',
       );
-      expect(mockAuthService.generateToken).toHaveBeenCalledWith(TEST_ADDRESS);
+      expect(mockAuthService.generateToken).toHaveBeenCalledWith(TEST_ADDRESS, 3600);
+      expect(mockAuthService.generateRefreshToken).toHaveBeenCalledWith(TEST_ADDRESS);
     });
 
     it('should throw on invalid signature', async () => {
@@ -65,7 +65,7 @@ describe('AuthController', () => {
           address: TEST_ADDRESS,
           signature: 'invalid',
         }),
-      ).rejects.toThrow('Invalid signature');
+      ).rejects.toThrow(UnauthorizedException);
     });
   });
 });

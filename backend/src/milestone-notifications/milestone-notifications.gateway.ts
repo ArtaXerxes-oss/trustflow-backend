@@ -15,13 +15,37 @@ import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { OUTBOX_GATEWAY_CHANNEL } from '../outbox/outbox-publisher.service';
 import { OutboxEvent } from '../outbox/outbox.types';
 import { EventDedupService } from './event-dedup.service';
+import { config } from '../config/env.config';
+
+/** Gig ids are `gig-<ts>-<rand>` today; accept any short id of safe characters (#393). */
+const GIG_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const ROOM_PREFIX = 'gig:';
+
+export interface SubscriptionAck {
+  event: 'subscribed' | 'unsubscribed' | 'error';
+  data: { gigId?: string; error?: string; backfilled?: number; resumeToken?: string };
+}
 
 export interface ClientEventPayload {
   v: number;
   type: string;
   data: unknown;
+  eventId?: string;
 }
 
+interface StoredMilestoneEvent {
+  eventId: string;
+  type: string;
+  data: unknown;
+  timestamp: number;
+}
+
+/*
+ * Handshake auth (#393): subscriptions stay unauthenticated for now — the events carry gig
+ * status already visible over the public REST API. Abuse is bounded instead by payload
+ * validation and the per-socket room cap (WS_MAX_ROOMS_PER_CLIENT). If private payloads
+ * are ever broadcast, add an AuthService.validateToken check in handleConnection.
+ */
 @WebSocketGateway({ cors: { origin: '*' } })
 export class MilestoneNotificationsGateway
   implements OnGatewayConnection, OnGatewayDisconnect, OnModuleInit, OnModuleDestroy
@@ -31,6 +55,10 @@ export class MilestoneNotificationsGateway
   /** Live client sockets, so a drain can notify and close them rather than just vanishing. */
   private readonly clients = new Map<string, Socket>();
   private draining = false;
+  /** In-memory sliding buffer of recent events per gig for reconnection catch-up (#930). */
+  private readonly recentEvents = new Map<string, StoredMilestoneEvent[]>();
+  private static readonly MAX_RECENT_EVENTS = 50;
+
   /**
    * Serialises outbox message handling.
    *
@@ -163,7 +191,7 @@ export class MilestoneNotificationsGateway
     }
 
     if (event.type.startsWith('gig.')) {
-      this.emitMilestoneUpdate(event.aggregateId, event.type, event.payload);
+      await this.emitMilestoneUpdate(event.aggregateId, event.type, event.payload, eventKey, true);
     } else if (event.type.startsWith('deliverable.')) {
       this.emitDeliverableUploaded(event.aggregateId, event.type, event.payload);
     }
@@ -189,26 +217,157 @@ export class MilestoneNotificationsGateway
     this.logger.log(`Client connected: ${client.id} (${this.clients.size} total)`);
   }
 
-  handleDisconnect(client: Socket) {
+  handleDisconnect(client: Socket, reason?: string) {
+    // Socket.IO removes a disconnected socket from all its rooms itself; this only tracks
+    // the connection count for observability (#393).
     this.clients.delete(client.id);
-    this.logger.log(`Client disconnected: ${client.id} (${this.clients.size} remaining)`);
+    this.logger.log(
+      `Client disconnected: ${client.id} (reason=${reason ?? 'unknown'}, ${this.clients.size} remaining)`,
+    );
+  }
+
+  /** Current connection and gig-room counts, for logs/metrics and the gateway spec. */
+  getStats(): { connections: number; rooms: number } {
+    const rooms = this.server?.sockets?.adapter?.rooms;
+    let gigRooms = 0;
+    if (rooms) {
+      for (const name of rooms.keys()) {
+        if (name.startsWith(ROOM_PREFIX)) gigRooms++;
+      }
+    }
+    return { connections: this.clients.size, rooms: gigRooms };
   }
 
   @SubscribeMessage('subscribe:gig')
-  handleSubscribeGig(@ConnectedSocket() client: Socket, @MessageBody() data: { gigId: string }) {
-    void client.join(`gig:${data.gigId}`);
-    return { event: 'subscribed', data: { gigId: data.gigId } };
+  handleSubscribeGig(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: unknown,
+  ): SubscriptionAck {
+    const gigId = this.parseGigId(data);
+    if (!gigId) return this.errorAck('invalid gigId');
+
+    const room = `${ROOM_PREFIX}${gigId}`;
+    const joined = this.gigRoomCount(client);
+    const alreadyJoined = client.rooms?.has?.(room) ?? false;
+    if (!alreadyJoined && joined >= config.WS_MAX_ROOMS_PER_CLIENT) {
+      this.logger.warn(
+        `Client ${client.id} hit the room cap (${config.WS_MAX_ROOMS_PER_CLIENT}); rejecting ${room}`,
+      );
+      return this.errorAck('room limit reached', gigId);
+    }
+
+    void client.join(room);
+    const stats = this.getStats();
+    this.logger.debug(
+      `Client ${client.id} joined ${room} (connections=${stats.connections}, rooms=${stats.rooms})`,
+    );
+
+    // Replay missed events if client provided a resume token or lastEventId (#930)
+    let backfilled = 0;
+    const resumeToken = this.parseResumeToken(data);
+    if (resumeToken) {
+      const history = this.recentEvents.get(gigId) || [];
+      const sinceIdx = history.findIndex(e => e.eventId === resumeToken);
+      const missed = sinceIdx >= 0 ? history.slice(sinceIdx + 1) : history;
+      for (const item of missed) {
+        const payload: ClientEventPayload = {
+          v: 1,
+          type: item.type,
+          data: item.data,
+          eventId: item.eventId,
+        };
+        client.emit('milestone:update', payload);
+        backfilled++;
+      }
+    }
+
+    const history = this.recentEvents.get(gigId);
+    const latestToken = history && history.length > 0 ? history[history.length - 1].eventId : undefined;
+
+    return {
+      event: 'subscribed',
+      data: {
+        gigId,
+        ...(backfilled > 0 ? { backfilled } : {}),
+        ...(latestToken ? { resumeToken: latestToken } : {}),
+      },
+    };
+  }
+
+  private parseResumeToken(data: unknown): string | null {
+    if (typeof data !== 'object' || data === null) return null;
+    const token =
+      (data as { resumeToken?: unknown; lastEventId?: unknown }).resumeToken ||
+      (data as { resumeToken?: unknown; lastEventId?: unknown }).lastEventId;
+    return typeof token === 'string' && token.trim() ? token.trim() : null;
   }
 
   @SubscribeMessage('unsubscribe:gig')
-  handleUnsubscribeGig(@ConnectedSocket() client: Socket, @MessageBody() data: { gigId: string }) {
-    void client.leave(`gig:${data.gigId}`);
-    return { event: 'unsubscribed', data: { gigId: data.gigId } };
+  handleUnsubscribeGig(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: unknown,
+  ): SubscriptionAck {
+    const gigId = this.parseGigId(data);
+    if (!gigId) return this.errorAck('invalid gigId');
+
+    void client.leave(`${ROOM_PREFIX}${gigId}`);
+    return { event: 'unsubscribed', data: { gigId } };
   }
 
-  emitMilestoneUpdate(gigId: string, type: string, data: unknown) {
+  /** Returns a valid gig id from an untrusted payload, or null — never throws. */
+  private parseGigId(data: unknown): string | null {
+    if (typeof data !== 'object' || data === null) return null;
+    const gigId = (data as { gigId?: unknown }).gigId;
+    return typeof gigId === 'string' && GIG_ID_PATTERN.test(gigId) ? gigId : null;
+  }
+
+  private gigRoomCount(client: Socket): number {
+    let count = 0;
+    for (const room of client.rooms ?? []) {
+      if (room.startsWith(ROOM_PREFIX)) count++;
+    }
+    return count;
+  }
+
+  private errorAck(error: string, gigId?: string): SubscriptionAck {
+    return { event: 'error', data: gigId ? { gigId, error } : { error } };
+  }
+
+  async emitMilestoneUpdate(
+    gigId: string,
+    type: string,
+    data: unknown,
+    eventId?: string,
+    isOutboxRelay = false,
+  ): Promise<void> {
     if (this.draining) return;
-    const payload: ClientEventPayload = { v: 1, type, data };
+
+    // Deduplicate against already-broadcast outbox / direct emits (#929)
+    if (eventId && !isOutboxRelay) {
+      const claimed = await this.dedup.claim(eventId);
+      if (!claimed) {
+        this.logger.debug(`Dropping duplicate direct milestone emit ${eventId}`);
+        return;
+      }
+    }
+
+    const payload: ClientEventPayload = {
+      v: 1,
+      type,
+      data,
+      ...(eventId ? { eventId } : {}),
+    };
+
+    // Store in recent events buffer for reconnection backfill (#930)
+    if (eventId) {
+      const history = this.recentEvents.get(gigId) || [];
+      history.push({ eventId, type, data, timestamp: Date.now() });
+      if (history.length > MilestoneNotificationsGateway.MAX_RECENT_EVENTS) {
+        history.shift();
+      }
+      this.recentEvents.set(gigId, history);
+    }
+
     this.server?.to(`gig:${gigId}`).emit('milestone:update', payload);
   }
 

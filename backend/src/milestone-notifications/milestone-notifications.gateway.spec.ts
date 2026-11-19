@@ -5,6 +5,10 @@ import { EventDedupService } from './event-dedup.service';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { OUTBOX_GATEWAY_CHANNEL } from '../outbox/outbox-publisher.service';
 import { OutboxEvent } from '../outbox/outbox.types';
+import { resetEnvConfig, validateEnv } from '../config/env.config';
+
+// The subscribe handlers read WS_MAX_ROOMS_PER_CLIENT from the validated config.
+validateEnv();
 
 /**
  * #646 — a milestone event must reach a connected client exactly once, no matter how many
@@ -167,7 +171,7 @@ describe('MilestoneNotificationsGateway', () => {
       {
         room: 'gig:gig-123',
         event: 'milestone:update',
-        payload: { v: 1, type: 'gig.accepted', data: { success: true } },
+        payload: { v: 1, type: 'gig.accepted', data: { success: true }, eventId: 'dedup-1' },
       },
     ]);
   });
@@ -407,6 +411,149 @@ describe('EventDedupService across replicas (#646)', () => {
     expect(metrics.increment).toHaveBeenCalledWith('gateway_event_dedup_claimed_total');
     expect(metrics.increment).toHaveBeenCalledWith('gateway_event_dedup_duplicate_total', {
       source: 'local',
+    });
+  });
+});
+
+/** #393 — subscribe payload validation, per-socket room cap and connection tracking. */
+describe('MilestoneNotificationsGateway subscriptions (#393)', () => {
+  let gateway: MilestoneNotificationsGateway;
+
+  /** A socket whose `rooms` set reflects join/leave, as Socket.IO's does. */
+  function roomSocket(id = 'room-client'): Socket & { rooms: Set<string> } {
+    const rooms = new Set<string>([id]);
+    return {
+      id,
+      rooms,
+      emit: jest.fn(),
+      disconnect: jest.fn(),
+      join: jest.fn((room: string) => rooms.add(room)),
+      leave: jest.fn((room: string) => rooms.delete(room)),
+    } as unknown as Socket & { rooms: Set<string> };
+  }
+
+  beforeEach(() => {
+    process.env.WS_MAX_ROOMS_PER_CLIENT = '3';
+    resetEnvConfig();
+    validateEnv();
+    gateway = new MilestoneNotificationsGateway(null, {} as EventDedupService);
+  });
+
+  afterEach(() => {
+    delete process.env.WS_MAX_ROOMS_PER_CLIENT;
+    resetEnvConfig();
+    validateEnv();
+  });
+
+  it.each([
+    undefined,
+    null,
+    'gig-1',
+    {},
+    { gigId: 42 },
+    { gigId: '' },
+    { gigId: 'a b' },
+    { gigId: 'x'.repeat(65) },
+  ])('returns an error ack and joins nothing for payload %p', payload => {
+    const client = roomSocket();
+    expect(() => gateway.handleSubscribeGig(client, payload)).not.toThrow();
+    expect(gateway.handleSubscribeGig(client, payload).event).toBe('error');
+    expect(gateway.handleUnsubscribeGig(client, payload).event).toBe('error');
+    expect(client.join).not.toHaveBeenCalled();
+    expect(client.leave).not.toHaveBeenCalled();
+  });
+
+  it('joins a valid gig room', () => {
+    const client = roomSocket();
+    expect(gateway.handleSubscribeGig(client, { gigId: 'gig-1700000000000-abc123' })).toEqual({
+      event: 'subscribed',
+      data: { gigId: 'gig-1700000000000-abc123' },
+    });
+    expect(client.rooms.has('gig:gig-1700000000000-abc123')).toBe(true);
+  });
+
+  it('caps the number of rooms one socket may join', () => {
+    const client = roomSocket();
+    for (let i = 0; i < 3; i++) {
+      expect(gateway.handleSubscribeGig(client, { gigId: `gig-${i}` }).event).toBe('subscribed');
+    }
+    const rejected = gateway.handleSubscribeGig(client, { gigId: 'gig-overflow' });
+    expect(rejected).toEqual({
+      event: 'error',
+      data: { gigId: 'gig-overflow', error: 'room limit reached' },
+    });
+    expect(client.rooms.has('gig:gig-overflow')).toBe(false);
+
+    // Re-subscribing to an already-joined room is not a new room and is allowed.
+    expect(gateway.handleSubscribeGig(client, { gigId: 'gig-0' }).event).toBe('subscribed');
+
+    // Leaving frees a slot.
+    gateway.handleUnsubscribeGig(client, { gigId: 'gig-1' });
+    expect(gateway.handleSubscribeGig(client, { gigId: 'gig-overflow' }).event).toBe('subscribed');
+  });
+
+  it('tracks connections and removes them on disconnect', () => {
+    const a = roomSocket('a');
+    const b = roomSocket('b');
+    gateway.handleConnection(a);
+    gateway.handleConnection(b);
+    expect(gateway.getStats().connections).toBe(2);
+
+    gateway.handleDisconnect(a, 'transport close');
+    expect(gateway.getStats().connections).toBe(1);
+    gateway.handleDisconnect(b);
+    expect(gateway.getStats().connections).toBe(0);
+  });
+
+  it('counts only gig rooms on the server adapter', () => {
+    gateway.server = {
+      sockets: {
+        adapter: {
+          rooms: new Map([
+            ['gig:1', new Set()],
+            ['gig:2', new Set()],
+            ['socket-id', new Set()],
+          ]),
+        },
+      },
+    } as unknown as Server;
+    expect(gateway.getStats().rooms).toBe(2);
+  });
+
+  describe('Milestone reconnect catch-up & duplicate delivery prevention (#929, #930)', () => {
+    it('backfills missed events to reconnecting clients with resumeToken (#930)', async () => {
+      // Dispatch 2 events to gig-99
+      await harness.dispatch({ aggregateId: 'gig-99', dedupKey: 'evt-1', payload: { step: 1 } });
+      await harness.dispatch({ aggregateId: 'gig-99', dedupKey: 'evt-2', payload: { step: 2 } });
+
+      const client = fakeSocket('reconnecting-socket');
+      harness.gateway.handleConnection(client);
+
+      // Reconnect with resumeToken='evt-1' -> should receive only evt-2
+      const ack = harness.gateway.handleSubscribeGig(client, {
+        gigId: 'gig-99',
+        resumeToken: 'evt-1',
+      });
+
+      expect(ack.event).toBe('subscribed');
+      expect(ack.data.gigId).toBe('gig-99');
+      expect(ack.data.backfilled).toBe(1);
+      expect(client.emit).toHaveBeenCalledWith('milestone:update', {
+        v: 1,
+        type: 'gig.accepted',
+        data: { step: 2 },
+        eventId: 'evt-2',
+      });
+    });
+
+    it('drops duplicate direct emits when already claimed (#929)', async () => {
+      // First outbox dispatch claims evt-100
+      await harness.dispatch({ aggregateId: 'gig-100', dedupKey: 'evt-100', payload: { direct: false } });
+      const countAfterOutbox = harness.emissions.length;
+
+      // Duplicate direct emit with the same eventId should be dropped
+      await harness.gateway.emitMilestoneUpdate('gig-100', 'gig.accepted', { direct: true }, 'evt-100');
+      expect(harness.emissions.length).toBe(countAfterOutbox);
     });
   });
 });

@@ -3,11 +3,15 @@ import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { StellarService } from './stellar.service';
 import { WebhookService } from '../webhook/webhook.service';
+import { config } from '../config/env.config';
 
 @Injectable()
 export class PlatformBalanceService {
   private readonly logger = new SanitizedLogger(PlatformBalanceService.name);
-  private lastAlertTime = 0;
+  private lastAlertTime: Record<'WARNING' | 'CRITICAL', number> = {
+    WARNING: 0,
+    CRITICAL: 0,
+  };
   private readonly alertCooldownMs = 3600000; // 1 hour cooldown between alerts
 
   constructor(
@@ -17,7 +21,7 @@ export class PlatformBalanceService {
 
   @Cron(CronExpression.EVERY_10_MINUTES)
   async checkPlatformBalance(): Promise<void> {
-    const platformAddress = process.env.STELLAR_PLATFORM_ADDRESS;
+    const platformAddress = config.STELLAR_PLATFORM_ADDRESS;
     if (!platformAddress) {
       this.logger.debug('STELLAR_PLATFORM_ADDRESS not configured, skipping balance check');
       return;
@@ -27,10 +31,16 @@ export class PlatformBalanceService {
       const balanceXlm = await this.stellarService.getBalance(platformAddress);
       const balance = parseFloat(balanceXlm);
 
-      const lowBalanceThreshold = parseFloat(process.env.STELLAR_LOW_BALANCE_THRESHOLD || '1');
-      const criticalBalanceThreshold = parseFloat(
-        process.env.STELLAR_CRITICAL_BALANCE_THRESHOLD || '0.5',
-      );
+      const lowBalanceThreshold = config.STELLAR_LOW_BALANCE_THRESHOLD;
+      const criticalBalanceThreshold = config.STELLAR_CRITICAL_BALANCE_THRESHOLD;
+
+      // Sanity check: if thresholds are invalid (NaN), log error and skip alerting
+      if (isNaN(balance) || isNaN(lowBalanceThreshold) || isNaN(criticalBalanceThreshold)) {
+        this.logger.error(
+          `Invalid balance or threshold values: balance=${balance}, low=${lowBalanceThreshold}, critical=${criticalBalanceThreshold}`,
+        );
+        return;
+      }
 
       if (balance <= criticalBalanceThreshold) {
         this.triggerAlert(
@@ -65,14 +75,15 @@ export class PlatformBalanceService {
     message: string,
   ): void {
     const now = Date.now();
-    if (now - this.lastAlertTime < this.alertCooldownMs) {
+    const lastAlert = this.lastAlertTime[level];
+    if (now - lastAlert < this.alertCooldownMs) {
       this.logger.debug(
-        `Alert cooldown active, skipping notification (last alert ${now - this.lastAlertTime}ms ago)`,
+        `Alert cooldown active for ${level}, skipping notification (last alert ${now - lastAlert}ms ago)`,
       );
       return;
     }
 
-    this.lastAlertTime = now;
+    this.lastAlertTime[level] = now;
     this.logger.warn(message);
 
     this.webhookService

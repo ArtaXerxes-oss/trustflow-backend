@@ -13,15 +13,22 @@ import { JwtService } from '@nestjs/jwt';
 import { Redis, Result } from 'ioredis';
 import { randomUUID } from 'crypto';
 import { REDIS_CLIENT } from '../redis/redis.module';
-import {
-  SKIP_RATE_LIMIT,
-  RATE_LIMIT_POINTS,
-  RATE_LIMIT_DURATION,
-  RATE_LIMIT_ON_REDIS_ERROR,
-  RateLimitRedisErrorPolicy,
-} from './rate-limit.decorator';
-import { config } from '../../config/env.config';
+import { config, getJwtVerificationSecrets } from '../../config/env.config';
 import { MetricsService } from '../../monitoring/metrics.service';
+import { RateTier, RATE_LIMIT_TIERS, HIGH_REPUTATION_THRESHOLD } from './rate-tiers';
+import './rate-limit.d';
+
+type RateLimitValue = number | (() => number) | undefined;
+
+function resolveLimit(value: RateLimitValue): number | undefined {
+  return typeof value === 'function' ? value() : value;
+}
+
+/** Keeps enough of an IP/wallet to correlate log lines without writing it out in full. */
+export function maskIdentity(value: string): string {
+  if (value.length <= 8) return '****';
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
+}
 
 const DEFAULT_POINTS = 100;
 const DEFAULT_DURATION = 60;
@@ -29,6 +36,11 @@ const DEFAULT_DURATION = 60;
 const REDIS_ERROR_LOG_INTERVAL_MS = 30_000;
 /** `Retry-After` advertised when a `deny` policy rejects a request during a Redis outage. */
 const REDIS_ERROR_RETRY_AFTER_SECONDS = 5;
+
+export type RateLimitIdentity = {
+  scope: 'ip' | 'wallet';
+  value: string;
+};
 
 /** Minimal shape of the HTTP request object that rate-limiting reads from. */
 interface RateLimitRequest {
@@ -100,7 +112,7 @@ if tokens >= 1 then
   tokens = tokens - 1
   redis.call('HSET', bucket_key, 'tokens', tokens, 'updatedAt', now)
   redis.call('PEXPIRE', bucket_key, bucket_ttl_ms)
-  return {1, 0}
+  return {1, math.floor(tokens)}
 end
 
 redis.call('HSET', bucket_key, 'tokens', tokens, 'updatedAt', now)
@@ -114,67 +126,76 @@ redis.call('EXPIRE', abuse_key, abuse_window_seconds)
 
 local abuse_count = redis.call('ZCARD', abuse_key)
 if abuse_count >= abuse_threshold then
-  redis.call('SET', lockout_key, '1', 'EX', lockout_seconds)
-  return {0, lockout_seconds}
+  -- Escalate lockout duration for repeat offenders within rolling window (#938)
+  local offense_key = KEYS[2] .. ':offenses'
+  local offenses = redis.call('INCR', offense_key)
+  redis.call('EXPIRE', offense_key, abuse_window_seconds * 2)
+  local effective_lockout = lockout_seconds * math.min(offenses, 10)
+  redis.call('SET', lockout_key, '1', 'EX', effective_lockout)
+  return {0, effective_lockout}
 end
 
 return {0, retry_after}
 `;
 
-declare module 'ioredis' {
-  interface RedisCommander<Context> {
-    rateLimitCheck(
-      bucketKey: string,
-      lockoutKey: string,
-      abuseKey: string,
-      capacity: number,
-      refillMs: number,
-      bucketTtlMs: number,
-      abuseWindowMs: number,
-      abuseWindowSeconds: number,
-      abuseThreshold: number,
-      lockoutSeconds: number,
-      member: string,
-    ): Result<[number, number], Context>;
-  }
-}
-
-type RateLimitIdentity = {
-  scope: 'ip' | 'wallet';
-  value: string;
+/** Maps a rate tier to its point limit and duration in seconds. */
+type RateTierConfig = {
+  points: number;
+  duration: number;
 };
 
+/** Rate tier configurations. */
+const RATE_TIER_CONFIGS: Record<string, RateTierConfig> = {
+  [RateTier.ANONYMOUS]: { points: 60, duration: 60 },
+  [RateTier.AUTHENTICATED]: { points: 300, duration: 60 },
+  [RateTier.HIGH_REPUTATION]: { points: 1000, duration: 60 },
+};
+
+/** Determines the effective tier config for a request. */
+function getTierConfig(
+  tier: keyof typeof RATE_LIMIT_TIERS,
+  requestedPoints?: number,
+  requestedDuration?: number,
+): RateTierConfig {
+  const config = RATE_TIER_CONFIGS[tier];
+  if (!config) return RATE_TIER_CONFIGS[RateTier.ANONYMOUS];
+  // If points/duration were explicitly overridden via decorator, use those
+  return {
+    points: requestedPoints ?? config.points,
+    duration: requestedDuration ?? config.duration,
+  };
+}
+
+/**
+ * Rate limiter guard with dynamic tier selection based on authentication status
+ * and platform reputation score. Returns RateLimit-* headers on every response.
+ */
 @Injectable()
 export class RateLimitGuard implements CanActivate {
   private readonly logger = new SanitizedLogger(RateLimitGuard.name);
-  // Not DI-managed: verify() takes the secret per call, so no module wiring is needed,
-  // and this guard runs as a global APP_GUARD before route-level JwtAuthGuard populates
-  // request.user, so it must be able to verify the bearer token itself.
-  private readonly jwtService = new JwtService();
-
-  private lastRedisErrorLogAt = 0;
-  private suppressedRedisErrors = 0;
+  private readonly reflector: Reflector;
 
   constructor(
     @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
-    private readonly reflector: Reflector,
+    private readonly jwtService: JwtService,
+    reflector: Reflector,
     @Optional() private readonly metrics?: MetricsService,
+    @Optional() private readonly reputationService?: import('../../reputation/reputation.service').ReputationService,
   ) {
-    if (!this.redis) {
-      // Logged once at startup, not on every request.
+    this.reflector = reflector;
+    if (this.redis) {
+      // Register the Lua script once at startup
+      if (typeof this.redis.rateLimitCheck !== 'function') {
+        this.redis.defineCommand('rateLimitCheck', { numberOfKeys: 3, lua: RATE_LIMIT_SCRIPT });
+      }
+    } else {
+      // Logged once here, not on every request in canActivate()'s `if (!this.redis) return true`.
       this.logger.warn('Redis not configured — rate limiting disabled');
-    }
-
-    // Registers redis.rateLimitCheck() (and pipeline.rateLimitCheck()) backed by EVALSHA,
-    // with ioredis handling the SCRIPT LOAD + NOSCRIPT-triggered re-send transparently — the
-    // Lua source is sent to Redis at most once per connection instead of on every request.
-    if (this.redis && typeof this.redis.rateLimitCheck !== 'function') {
-      this.redis.defineCommand('rateLimitCheck', { numberOfKeys: 3, lua: RATE_LIMIT_SCRIPT });
     }
   }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
-    const skip = this.reflector.getAllAndOverride<boolean>(SKIP_RATE_LIMIT, [
+    const skip = this.reflector.getAllAndOverride<boolean>('skip_rate_limit', [
       context.getHandler(),
       context.getClass(),
     ]);
@@ -182,21 +203,62 @@ export class RateLimitGuard implements CanActivate {
 
     if (!this.redis) return true;
 
-    const points =
-      this.reflector.getAllAndOverride<number>(RATE_LIMIT_POINTS, [
-        context.getHandler(),
-        context.getClass(),
-      ]) ?? DEFAULT_POINTS;
-
-    const duration =
-      this.reflector.getAllAndOverride<number>(RATE_LIMIT_DURATION, [
-        context.getHandler(),
-        context.getClass(),
-      ]) ?? DEFAULT_DURATION;
-
     const request = context.switchToHttp().getRequest();
     const route = this.getRoute(request);
     const identities = this.getIdentities(request);
+
+    // Determine the effective tier for this request
+    let tier: keyof typeof RATE_LIMIT_TIERS = RateTier.ANONYMOUS;
+
+    // Check if there's a wallet identity from JWT (authenticated user)
+    const wallet = this.extractVerifiedWallet(request);
+
+    if (wallet) {
+      // Authenticated user — check reputation score
+      try {
+        if (this.reputationService) {
+          const scoreData = await this.reputationService.getScore(wallet);
+          const score = scoreData.score ?? 0;
+          if (score >= HIGH_REPUTATION_THRESHOLD) {
+            tier = RateTier.HIGH_REPUTATION;
+          } else {
+            tier = RateTier.AUTHENTICATED;
+          }
+        } else {
+          // No reputation service available, use authenticated tier
+          tier = RateTier.AUTHENTICATED;
+        }
+      } catch (error) {
+        this.logger.warn(`Failed to fetch reputation score for wallet ${wallet}: ${error instanceof Error ? error.message : String(error)}`);
+        // On reputation service failure, fall back to authenticated tier
+        tier = RateTier.AUTHENTICATED;
+      }
+    } else {
+      // Unauthenticated — anonymous tier
+      tier = RateTier.ANONYMOUS;
+    }
+
+    // Use tier-specific points/duration if not explicitly overridden via decorator
+    // Decorator values may be thunks so env-configured limits (e.g. the auth routes) are read
+    // at request time rather than when the controller class is first loaded.
+    const requestedPoints = resolveLimit(
+      this.reflector.getAllAndOverride<RateLimitValue>('rate_limit_points', [
+        context.getHandler(),
+        context.getClass(),
+      ]),
+    );
+    const requestedDuration = resolveLimit(
+      this.reflector.getAllAndOverride<RateLimitValue>('rate_limit_duration', [
+        context.getHandler(),
+        context.getClass(),
+      ]),
+    );
+
+    const tierConfig = getTierConfig(
+      tier,
+      requestedPoints,
+      requestedDuration,
+    );
 
     const abuseWindow = config.RATE_LIMIT_ABUSE_WINDOW_SECONDS;
     const abuseThreshold = config.RATE_LIMIT_ABUSE_THRESHOLD;
@@ -211,9 +273,9 @@ export class RateLimitGuard implements CanActivate {
         keys.bucket,
         keys.lockout,
         keys.abuse,
-        points,
-        duration * 1000,
-        duration * 2 * 1000,
+        tierConfig.points,
+        tierConfig.duration * 1000,
+        tierConfig.duration * 2 * 1000,
         abuseWindow * 1000,
         abuseWindow,
         abuseThreshold,
@@ -238,6 +300,17 @@ export class RateLimitGuard implements CanActivate {
       const [allowed, retryAfter] = decisions[i];
       if (Number(allowed) !== 1) {
         const identity = identities[i];
+        const retryAfterSeconds = Math.max(1, Math.ceil(Number(retryAfter)));
+        const response = context.switchToHttp().getResponse();
+        response?.setHeader?.('Retry-After', String(retryAfterSeconds));
+        response?.setHeader?.('X-RateLimit-Limit', String(tierConfig.points));
+        response?.setHeader?.('X-RateLimit-Remaining', '0');
+        response?.setHeader?.('X-RateLimit-Reset', String(retryAfterSeconds));
+        this.metrics?.increment('rate_limit_rejections_total', { route, scope: identity.scope });
+        this.logger.warn(
+          `Rate limit exceeded (scope=${identity.scope}, route=${route}, ` +
+            `identity=${maskIdentity(identity.value)}, retryAfter=${retryAfterSeconds}s)`,
+        );
         throw new HttpException(
           {
             statusCode: HttpStatus.TOO_MANY_REQUESTS,
@@ -249,6 +322,10 @@ export class RateLimitGuard implements CanActivate {
         );
       }
     }
+
+    // Response-time headers: set on the response object after the guard passes
+    const response = context.switchToHttp().getResponse();
+    this.setRateLimitHeaders(response, tier, tierConfig, decisions);
 
     return true;
   }
@@ -289,8 +366,7 @@ export class RateLimitGuard implements CanActivate {
   /**
    * Applies the configured outage policy: `allow` (fail open) lets the request through,
    * `deny` (fail closed) rejects it with 503 + `Retry-After`. The route's
-   * `@RateLimitOnRedisError()` / `@RateLimit(..., { onRedisError })` metadata wins over the
-   * global `RATE_LIMIT_ON_REDIS_ERROR` default. Never surfaces a generic 500.
+   * metadata wins over the global `RATE_LIMIT_ON_REDIS_ERROR` default. Never surfaces a generic 500.
    */
   private onRedisError(
     context: ExecutionContext,
@@ -298,11 +374,22 @@ export class RateLimitGuard implements CanActivate {
     identities: RateLimitIdentity[],
     route: string,
   ): boolean {
-    const policy: RateLimitRedisErrorPolicy =
-      this.reflector.getAllAndOverride<RateLimitRedisErrorPolicy>(RATE_LIMIT_ON_REDIS_ERROR, [
-        context.getHandler(),
-        context.getClass(),
-      ]) ?? config.RATE_LIMIT_ON_REDIS_ERROR;
+    const isAuthRoute =
+      route.startsWith('/auth') ||
+      route.startsWith('auth') ||
+      route.includes('/auth/') ||
+      route.endsWith('/auth');
+
+    const routePolicy = this.reflector.getAllAndOverride<'allow' | 'deny'>('rate_limit_on_redis_error', [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    // /auth/* is hardcoded to deny on Redis outage as an essential security rule.
+    // Non-auth routes honor the route override if present, otherwise falling back to RATE_LIMIT_ON_REDIS_ERROR.
+    const policy: 'allow' | 'deny' = isAuthRoute
+      ? 'deny'
+      : (routePolicy ?? config.RATE_LIMIT_ON_REDIS_ERROR ?? 'allow');
 
     this.metrics?.increment('rate_limit_redis_error_total', { route, policy });
     this.logRedisError(error, identities, route, policy);
@@ -328,7 +415,7 @@ export class RateLimitGuard implements CanActivate {
     error: unknown,
     identities: RateLimitIdentity[],
     route: string,
-    policy: RateLimitRedisErrorPolicy,
+    policy: 'allow' | 'deny',
   ): void {
     const now = Date.now();
     if (now - this.lastRedisErrorLogAt < REDIS_ERROR_LOG_INTERVAL_MS) {
@@ -426,7 +513,10 @@ export class RateLimitGuard implements CanActivate {
     identity: string,
     route: string,
   ): { bucket: string; lockout: string; abuse: string } {
-    const tag = `${scope}:${identity}:${route}`;
+    const network = (config.STELLAR_NETWORK || 'testnet').toLowerCase();
+    const tag = scope === 'wallet'
+      ? `${scope}:${network}:${identity}:${route}`
+      : `${scope}:${identity}:${route}`;
     return {
       bucket: `ratelimit:{${tag}}:bucket`,
       lockout: `ratelimit:{${tag}}:lockout`,
@@ -438,5 +528,67 @@ export class RateLimitGuard implements CanActivate {
     return String(value)
       .toLowerCase()
       .replace(/[^a-z0-9:._-]/g, '_');
+  }
+
+  // Instance state for error logging suppression
+  private lastRedisErrorLogAt = 0;
+  private suppressedRedisErrors = 0;
+
+  /**
+   * Sets RateLimit-* headers on the response based on the tier and bucket state.
+   * With multiple identities per request (e.g. IP + wallet), the tighter (lower-remaining)
+   * decision drives the advertised headers so the client paces itself against whichever
+   * bucket is closer to exhaustion.
+   */
+  private setRateLimitHeaders(
+    response: any,
+    tier: keyof typeof RATE_LIMIT_TIERS,
+    tierConfigOrDecisions: RateTierConfig | Array<[number, number]>,
+    maybeDecisions?: Array<[number, number]>,
+  ): void {
+    let tierConfig: RateTierConfig;
+    let decisions: Array<[number, number]>;
+
+    if (Array.isArray(tierConfigOrDecisions)) {
+      decisions = tierConfigOrDecisions;
+      tierConfig = RATE_TIER_CONFIGS[tier] ?? { points: DEFAULT_POINTS, duration: DEFAULT_DURATION };
+    } else {
+      tierConfig = tierConfigOrDecisions ?? RATE_TIER_CONFIGS[tier] ?? { points: DEFAULT_POINTS, duration: DEFAULT_DURATION };
+      decisions = maybeDecisions ?? [];
+    }
+
+    if (!tierConfig || !response?.setHeader) return;
+
+    let minRemaining = tierConfig.points;
+    let maxReset = 0;
+
+    if (decisions && decisions.length > 0) {
+      for (const [allowed, value] of decisions) {
+        if (allowed === 1) {
+          // When allowed, the Lua script returns the remaining tokens in the bucket.
+          // Pick the tighter (lower remaining) of all identities.
+          const remaining = Math.max(0, value);
+          if (remaining < minRemaining) {
+            minRemaining = remaining;
+          }
+        } else {
+          // When rejected, remaining is 0 and value is the retryAfter in seconds.
+          minRemaining = 0;
+          if (value > maxReset) {
+            maxReset = value;
+          }
+        }
+      }
+    } else {
+      minRemaining = Math.max(0, tierConfig.points - 1);
+    }
+
+    response.setHeader('RateLimit-Limit', String(tierConfig.points));
+    response.setHeader('RateLimit-Remaining', String(minRemaining));
+    response.setHeader('RateLimit-Reset', String(Math.ceil(maxReset)));
+
+    this.logger.debug(
+      `Rate limit headers set — tier: ${tier}, limit: ${tierConfig.points}, remaining: ${minRemaining}, reset: ${Math.ceil(maxReset)}s`,
+    );
   }
 }

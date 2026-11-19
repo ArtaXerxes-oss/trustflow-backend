@@ -11,6 +11,7 @@ import { MetricsHttpInterceptor } from './monitoring/metrics-http.interceptor';
 import { RequestTimeoutInterceptor } from './common/http/request-timeout.interceptor';
 import { CorrelationIdStore } from './common/logging/correlation-id.store';
 import { config } from './config/env.config';
+import { classValidatorExceptionFactory } from './common/validation/validation-error';
 
 const logger = new SanitizedLogger('AppSetup');
 
@@ -58,6 +59,14 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
   // this function so the regression went unnoticed.
   app.use(createSecurityHeadersMiddleware());
 
+  // Behind a load balancer `request.ip` is the proxy's address unless Express is told to
+  // trust it, which would put every client in one rate-limit bucket. See TRUST_PROXY in
+  // env.config.ts and "Proxy / client IP" in API_DOCUMENTATION.md (#369).
+  const trustProxy = parseTrustProxy(config.TRUST_PROXY);
+  if (trustProxy !== false) {
+    (app as unknown as { set(key: string, value: unknown): void }).set('trust proxy', trustProxy);
+  }
+
   // Explicit body-size limit for JSON payloads.
   // The IPFS pin endpoint accepts base64-encoded deliverable content; 10 MB decoded
   // encodes to ~13.6 MB base64, so a 15 MB JSON limit gives adequate headroom while
@@ -90,9 +99,9 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
   const nodeEnv = config.NODE_ENV;
 
   // Validate CORS configuration in production
-  if (nodeEnv === 'production' && (!corsOrigin || corsOrigin.includes('*'))) {
+  if (nodeEnv === 'production' && (!corsOrigin || corsOrigin.length === 0 || corsOrigin.includes('*'))) {
     logger.error(
-      'CORS_ORIGIN must be explicitly set in production (cannot use wildcard with credentials: true)',
+      'CORS_ORIGIN must be explicitly set to allowed origins in production (cannot use wildcard with credentials: true)',
     );
     process.exit(1);
   }
@@ -115,6 +124,8 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
       whitelist: true,
       transform: true,
       forbidNonWhitelisted: true,
+      // Same `{ statusCode, message, errors: [{ field, message }] }` shape as Zod failures (#368)
+      exceptionFactory: classValidatorExceptionFactory,
     }),
   );
 
@@ -135,6 +146,19 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
     const indexer = app.get(SorobanEventIndexerService);
     indexer.start();
   }
+}
+
+/**
+ * Maps the TRUST_PROXY string onto Express's accepted forms: boolean, hop count, or an
+ * address list. Only trust what is actually in front of the app — `true` lets any client
+ * spoof `X-Forwarded-For` when the service is reachable directly.
+ */
+export function parseTrustProxy(value: string | undefined): boolean | number | string[] {
+  const v = (value ?? 'false').trim().toLowerCase();
+  if (v === '' || v === 'false') return false;
+  if (v === 'true') return true;
+  if (/^\d+$/.test(v)) return Number(v);
+  return v.split(',').map(part => part.trim()).filter(Boolean);
 }
 
 /**

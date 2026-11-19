@@ -5,6 +5,11 @@ import { EscrowChainStateClient } from './escrow-chain-state.client';
 import { EscrowReconciliationStateStore } from './escrow-reconciliation-state.store';
 import { InvalidChainStateError } from './chain-escrow.validation';
 import { ChainEscrowRecord, DriftType, RECONCILIATION_EVENTS } from './escrow-reconciliation.types';
+import { resetEnvConfig, setTestEnv, validateEnv } from '../config/env.config';
+
+// reconcile() reads config.ESCROW_RECONCILIATION_SWEEP_CONCURRENCY, which requires
+// validateEnv() to have run first — normally done once in main.ts.
+validateEnv();
 
 function makeEscrow(overrides: Partial<Escrow> = {}): Escrow {
   return {
@@ -68,6 +73,10 @@ describe('EscrowReconciliationService', () => {
     } else {
       process.env.ESCROW_RECONCILIATION_SWEEP_CONCURRENCY = originalConcurrency;
     }
+    // Re-validate so a per-test override (via setTestEnv) doesn't leak into the next test.
+    delete process.env.ADMIN_DASHBOARD_URL;
+    resetEnvConfig();
+    validateEnv();
   });
 
   describe('no drift', () => {
@@ -121,7 +130,67 @@ describe('EscrowReconciliationService', () => {
       expect(webhookService.dispatch).toHaveBeenCalledWith(
         RECONCILIATION_EVENTS.DRIFT_DETECTED,
         expect.objectContaining({ driftCount: 1 }),
-      });
+      );
+    });
+  });
+
+  // #991: every drift record should carry a direct link to the affected escrow's admin
+  // detail page, built from ADMIN_DASHBOARD_URL, so a responder doesn't have to manually
+  // copy the contract escrow ID and navigate to it.
+  describe('admin deep links (#991)', () => {
+    it('includes an admin deep link on each drift when ADMIN_DASHBOARD_URL is configured', async () => {
+      setTestEnv({ ADMIN_DASHBOARD_URL: 'https://admin.trustflow.example' });
+      const escrow = makeEscrow({ status: 'active' });
+      escrowService.findAll.mockResolvedValue([escrow]);
+      chainClient.getEscrow.mockResolvedValue(makeChainRecord({ status: 'released' }));
+      escrowService.applyChainState.mockResolvedValue({ ...escrow, status: 'released' });
+
+      const run = await service.reconcile();
+
+      expect(run.drifts[0].adminUrl).toBe(
+        'https://admin.trustflow.example/escrows/chain-esc-1',
+      );
+    });
+
+    it('strips a trailing slash from ADMIN_DASHBOARD_URL before building the link', async () => {
+      setTestEnv({ ADMIN_DASHBOARD_URL: 'https://admin.trustflow.example/' });
+      const escrow = makeEscrow({ status: 'active' });
+      escrowService.findAll.mockResolvedValue([escrow]);
+      chainClient.getEscrow.mockResolvedValue(makeChainRecord({ status: 'released' }));
+      escrowService.applyChainState.mockResolvedValue({ ...escrow, status: 'released' });
+
+      const run = await service.reconcile();
+
+      expect(run.drifts[0].adminUrl).toBe(
+        'https://admin.trustflow.example/escrows/chain-esc-1',
+      );
+    });
+
+    it('omits adminUrl entirely when ADMIN_DASHBOARD_URL is not configured', async () => {
+      const escrow = makeEscrow({ status: 'active' });
+      escrowService.findAll.mockResolvedValue([escrow]);
+      chainClient.getEscrow.mockResolvedValue(makeChainRecord({ status: 'released' }));
+      escrowService.applyChainState.mockResolvedValue({ ...escrow, status: 'released' });
+
+      const run = await service.reconcile();
+
+      expect(run.drifts[0].adminUrl).toBeUndefined();
+    });
+
+    it('URL-encodes the contract escrow id in the deep link', async () => {
+      setTestEnv({ ADMIN_DASHBOARD_URL: 'https://admin.trustflow.example' });
+      const escrow = makeEscrow({ status: 'active', contractEscrowId: 'chain esc/1' });
+      escrowService.findAll.mockResolvedValue([escrow]);
+      chainClient.getEscrow.mockResolvedValue(
+        makeChainRecord({ status: 'released', contractEscrowId: 'chain esc/1' }),
+      );
+      escrowService.applyChainState.mockResolvedValue({ ...escrow, status: 'released' });
+
+      const run = await service.reconcile();
+
+      expect(run.drifts[0].adminUrl).toBe(
+        'https://admin.trustflow.example/escrows/chain%20esc%2F1',
+      );
     });
   });
 
@@ -261,7 +330,7 @@ describe('EscrowReconciliationService', () => {
     });
 
     it('bounds chain reads using the configured concurrency', async () => {
-      process.env.ESCROW_RECONCILIATION_SWEEP_CONCURRENCY = '2';
+      setTestEnv({ ESCROW_RECONCILIATION_SWEEP_CONCURRENCY: '2' });
       const escrows = Array.from({ length: 6 }, (_, index) =>
         makeEscrow({ id: `esc-${index}`, contractEscrowId: `chain-esc-${index}` }),
       );

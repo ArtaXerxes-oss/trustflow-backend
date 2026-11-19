@@ -1,16 +1,21 @@
 import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
-import { AuthModule } from './auth/auth.module';
-import { EscrowModule } from './escrow/escrow.module';
-import { WebhookModule } from './webhook/webhook.module';
-import { MonitoringModule } from './monitoring/monitoring.module';
-import { StellarModule } from './stellar/stellar.module';
-import { SentryModule } from './sentry/sentry.module';
+import { LoggingModule } from './common/logging/logging.module';
+import { CorrelationIdMiddleware } from './common/logging/correlation-id.middleware';
+import { ShutdownModule } from './common/shutdown/shutdown.module';
+import { DrainMiddleware } from './common/shutdown/drain.middleware';
 import { RedisModule } from './common/redis/redis.module';
 import { DatabaseModule } from './common/database/database.module';
 import { RateLimitModule } from './common/rate-limit/rate-limit.module';
 import { IdempotencyModule } from './common/idempotency/idempotency.module';
+import { AuthModule } from './auth/auth.module';
 import { UserProfileModule } from './user-profile/user-profile.module';
+import { EscrowModule } from './escrow/escrow.module';
+import { EscrowGraphQLModule } from './escrow/graphql/escrow-graphql.module';
+import { WebhookModule } from './webhook/webhook.module';
+import { MonitoringModule } from './monitoring/monitoring.module';
+import { StellarModule } from './stellar/stellar.module';
+import { SentryModule } from './sentry/sentry.module';
 import { EventIngestionModule } from './event-ingestion/event-ingestion.module';
 import { DisputeModule } from './dispute/dispute.module';
 import { MigrationModule } from './migration/migration.module';
@@ -23,16 +28,15 @@ import { DeliverableModule } from './deliverable/deliverable.module';
 import { MilestoneNotificationsModule } from './milestone-notifications/milestone-notifications.module';
 import { SorobanEventIndexerModule } from './soroban-event-indexer/soroban-event-indexer.module';
 import { OutboxModule } from './outbox/outbox.module';
-import { LoggingModule } from './common/logging/logging.module';
-import { CorrelationIdMiddleware } from './common/logging/correlation-id.middleware';
-import { ShutdownModule } from './common/shutdown/shutdown.module';
-import { DrainMiddleware } from './common/shutdown/drain.middleware';
-
 import { AuditModule } from './audit/audit.module';
+import { TracingModule } from './monitoring/tracing.module';
+
+import { CacheModule } from './common/cache.module';
 
 @Module({
   imports: [
     ScheduleModule.forRoot(),
+    CacheModule,
     LoggingModule,
     ShutdownModule,
     SentryModule,
@@ -43,6 +47,7 @@ import { AuditModule } from './audit/audit.module';
     AuthModule,
     UserProfileModule,
     EscrowModule,
+    EscrowGraphQLModule,
     WebhookModule,
     MonitoringModule,
     StellarModule,
@@ -59,6 +64,7 @@ import { AuditModule } from './audit/audit.module';
     SorobanEventIndexerModule,
     OutboxModule,
     AuditModule,
+    TracingModule,
   ],
 })
 export class AppModule implements NestModule {

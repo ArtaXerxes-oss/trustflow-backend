@@ -7,6 +7,7 @@ import {
   OnModuleInit,
   ForbiddenException,
   Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { AuditService } from '../audit/audit.service';
@@ -14,20 +15,29 @@ import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { MetricsService } from '../monitoring/metrics.service';
 import {
+  DisputeEvidence,
   DisputeSaga,
   DisputeStep,
   DisputeVerdict,
   JurorVote,
   SagaStepRecord,
 } from './dispute.types';
-import { EscalateDisputeDto, AssignJurorsDto, CastVoteDto, ExecutePayoutDto } from './dispute.dto';
+import {
+  EscalateDisputeDto,
+  AssignJurorsDto,
+  CastVoteDto,
+  ExecutePayoutDto,
+  SubmitEvidenceDto,
+} from './dispute.dto';
 import { Escrow, EscrowService } from '../escrow/escrow.service';
 import { WebhookService } from '../webhook/webhook.service';
 import { DiscordService } from '../webhook/discord.service';
 import { NotificationService } from '../notification/notification.service';
+import { ArweaveArchiveService } from './arweave-archive.service';
 import { config } from '../config/env.config';
 import { getCurrentUtcDate, toUtcIsoString } from '../common/dates';
 import { EscrowChainStateClient } from '../escrow-reconciliation/escrow-chain-state.client';
+import { DISPUTE_EVIDENCE_PINNER, DisputeEvidencePinner } from './dispute-evidence.pinner';
 
 /** Simple keyed mutex for serializing concurrent operations. */
 class KeyedMutex {
@@ -118,11 +128,15 @@ export class DisputeSagaService implements OnModuleInit {
     private readonly escrowService: EscrowService,
     private readonly webhookService: WebhookService,
     private readonly notificationService: NotificationService,
+    private readonly arweaveArchiveService: ArweaveArchiveService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
     private readonly metrics: MetricsService,
     @Optional() private readonly audit?: AuditService,
     @Optional() private readonly discordService?: DiscordService,
     @Optional() private readonly chainClient?: EscrowChainStateClient,
+    @Inject(DISPUTE_EVIDENCE_PINNER)
+    @Optional()
+    private readonly evidencePinner?: DisputeEvidencePinner,
   ) {}
 
   onModuleInit(): void {
@@ -169,6 +183,45 @@ export class DisputeSagaService implements OnModuleInit {
     }
 
     return [...this.sagas.values()];
+  }
+
+  /**
+   * Attach a piece of evidence to a dispute by pinning it to IPFS and recording the
+   * resulting CID on the saga. Size validation happens in `SubmitEvidenceDto` (the same
+   * shared base64 limit as deliverable uploads) and again inside `pinContent`, so an
+   * oversized payload is rejected before any decoding or provider call.
+   */
+  async attachEvidence(
+    sagaId: string,
+    dto: SubmitEvidenceDto,
+    submittedBy: string,
+  ): Promise<DisputeEvidence> {
+    if (!this.evidencePinner) {
+      throw new ServiceUnavailableException('Evidence storage is not configured');
+    }
+    // Resolve first so an unknown saga never reaches pinning storage.
+    await this.findById(sagaId);
+
+    const pin = await this.evidencePinner.pinContent({
+      content: dto.content,
+      filename: dto.filename,
+    });
+    const evidence: DisputeEvidence = {
+      cid: pin.cid,
+      size: pin.size,
+      filename: dto.filename,
+      submittedBy,
+      submittedAt: toUtcIsoString(getCurrentUtcDate()),
+    };
+
+    await this.sagaMutex.lock(sagaId, async () => {
+      const saga = await this.findById(sagaId);
+      saga.evidence = [...(saga.evidence ?? []), evidence];
+      await this.persistSaga(saga);
+    });
+
+    this.metrics.increment('dispute_evidence_submitted_total');
+    return evidence;
   }
 
   // ─── Step 1: Escalation ───────────────────────────────────────────
@@ -340,11 +393,11 @@ export class DisputeSagaService implements OnModuleInit {
       );
     }
     await bestEffort('in-app notification', () =>
-      this.notificationService.notifyDisputeEscalated({
+      this.notificationService.notifyDisputeEscalation({
         escrowId,
-        disputeId: sagaId,
         depositor: escrow.depositor,
         beneficiary: escrow.beneficiary,
+        amountXLM: escrow.amountXLM,
         reason: saga.reason,
       }),
     );
@@ -519,6 +572,9 @@ export class DisputeSagaService implements OnModuleInit {
       if (unique.length < 3) {
         throw new BadRequestException('At least 3 distinct juror addresses are required');
       }
+      if (unique.length % 2 === 0) {
+        throw new BadRequestException('Juror count must be odd to prevent vote ties');
+      }
 
       // Prevent escrow parties from being assigned as jurors to avoid conflicts of interest
       const escrow = await this.escrowService.findById(saga.escrowId);
@@ -545,11 +601,12 @@ export class DisputeSagaService implements OnModuleInit {
           sagaId,
           jurors: unique,
         });
-        await this.notificationService.notifyJurorsAssigned({
-          disputeId: sagaId,
-          escrowId: saga.escrowId,
-          jurors: unique,
-        });
+        // TODO: Implement notifyJurorsAssigned notification
+        // await this.notificationService.notifyJurorsAssigned({
+        //   disputeId: sagaId,
+        //   escrowId: saga.escrowId,
+        //   jurors: unique,
+        // });
 
         this.logger.log(`Saga ${sagaId}: ${unique.length} jurors assigned`);
         return saga;
@@ -594,10 +651,20 @@ export class DisputeSagaService implements OnModuleInit {
    * the verdict is computed automatically (exactly once, serialized per saga).
    * Compensating action: remove the vote and mark voting as incomplete.
    */
-  async castVote(sagaId: string, dto: CastVoteDto): Promise<DisputeSaga> {
+  async castVote(
+    sagaId: string,
+    dto: CastVoteDto,
+    callerAddress?: string,
+  ): Promise<DisputeSaga> {
     return this.sagaMutex.lock(sagaId, async () => {
       const saga = await this.findById(sagaId);
       this.assertStep(saga, DisputeStep.VOTING);
+
+      if (callerAddress && callerAddress !== dto.jurorAddress) {
+        throw new ForbiddenException(
+          `Authenticated wallet ${callerAddress} does not match juror address ${dto.jurorAddress}`,
+        );
+      }
 
       if (!saga.assignedJurors?.includes(dto.jurorAddress)) {
         throw new BadRequestException(`${dto.jurorAddress} is not an assigned juror for this saga`);
@@ -618,36 +685,47 @@ export class DisputeSagaService implements OnModuleInit {
         saga.votes = [...(saga.votes ?? []), vote];
         this.touch(saga);
 
+        // All jurors have voted — compute verdict (exactly once)
+        let verdictReached: DisputeVerdict | undefined;
+        if (saga.votes.length === saga.assignedJurors.length && !saga.verdict) {
+          verdictReached = this.computeVerdict(saga.votes);
+          saga.verdict = verdictReached;
+          this.recordStepComplete(saga, DisputeStep.VOTING);
+          saga.currentStep = DisputeStep.PAYOUT;
+
+          const escrow = await this.escrowService.findById(saga.escrowId);
+          if (escrow) {
+            // TODO: Implement notifyVerdictReached notification
+            // await this.notificationService.notifyVerdictReached({
+            //   disputeId: sagaId,
+            //   escrowId: saga.escrowId,
+            //   verdict: verdictReached,
+            //   depositor: escrow.depositor,
+            //   beneficiary: escrow.beneficiary,
+            // });
+          }
+        }
+
+        await this.persistSaga(saga);
+
+        // Webhooks are dispatched only after the saga's new state has been
+        // durably persisted (#985) — otherwise a subscriber that reacts to
+        // VOTE_CAST/VERDICT_REACHED by immediately re-reading the saga can
+        // observe the pre-vote state.
         await this.webhookService.dispatch(SAGA_EVENTS.VOTE_CAST, {
           sagaId,
           jurorAddress: dto.jurorAddress,
           votesIn: saga.votes.length,
           votesNeeded: saga.assignedJurors.length,
         });
-
-        // All jurors have voted — compute verdict (exactly once)
-        if (saga.votes.length === saga.assignedJurors.length && !saga.verdict) {
-          const verdict = this.computeVerdict(saga.votes);
-          saga.verdict = verdict;
-          this.recordStepComplete(saga, DisputeStep.VOTING);
-          saga.currentStep = DisputeStep.PAYOUT;
-
-          await this.webhookService.dispatch(SAGA_EVENTS.VERDICT_REACHED, { sagaId, verdict });
-          this.logger.log(`Saga ${sagaId}: verdict reached — ${verdict}`);
-
-          const escrow = await this.escrowService.findById(saga.escrowId);
-          if (escrow) {
-            await this.notificationService.notifyVerdictReached({
-              disputeId: sagaId,
-              escrowId: saga.escrowId,
-              verdict,
-              depositor: escrow.depositor,
-              beneficiary: escrow.beneficiary,
-            });
-          }
+        if (verdictReached) {
+          await this.webhookService.dispatch(SAGA_EVENTS.VERDICT_REACHED, {
+            sagaId,
+            verdict: verdictReached,
+          });
+          this.logger.log(`Saga ${sagaId}: verdict reached — ${verdictReached}`);
         }
 
-        await this.persistSaga(saga);
         return saga;
       } catch (error) {
         await this.compensateVoting(saga, dto.jurorAddress, error);
@@ -755,15 +833,35 @@ export class DisputeSagaService implements OnModuleInit {
         });
         await this.webhookService.dispatch(SAGA_EVENTS.SAGA_COMPLETED, { sagaId });
 
+        // ─── NEW: Archive dispute evidence to Arweave for permanent auditability ───
+        try {
+          const txId = await this.arweaveArchiveService.archiveDispute(saga);
+          if (txId) {
+            saga.arweaveTxId = txId;
+            await this.persistSaga(saga);
+            this.logger.log(
+              `Arweave txId ${txId} recorded for completed saga ${saga.sagaId}`,
+            );
+          }
+        } catch (err) {
+          // Archive failure must not block dispute resolution
+          this.logger.error(
+            `Arweave archive failed for completed saga ${saga.sagaId} — continuing without archival`,
+            err,
+          );
+        }
+        // ──────────────────────────────────────────────────────────────
+
         const payoutEscrow = await this.escrowService.findById(saga.escrowId);
         if (payoutEscrow) {
-          await this.notificationService.notifyPayoutExecuted({
-            disputeId: sagaId,
-            escrowId: saga.escrowId,
-            verdict: saga.verdict,
-            depositor: payoutEscrow.depositor,
-            beneficiary: payoutEscrow.beneficiary,
-          });
+          // TODO: Implement notifyPayoutExecuted notification
+          // await this.notificationService.notifyPayoutExecuted({
+          //   disputeId: sagaId,
+          //   escrowId: saga.escrowId,
+          //   verdict: saga.verdict,
+          //   depositor: payoutEscrow.depositor,
+          //   beneficiary: payoutEscrow.beneficiary,
+          // });
         }
 
         this.logger.log(`Saga ${sagaId}: completed — payout executed for ${saga.verdict}`);

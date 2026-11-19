@@ -1,5 +1,13 @@
 import { HealthService } from './health.service';
 import { DatabaseService } from '../common/database/database.service';
+import { DrainStateService } from '../common/shutdown/drain-state.service';
+import { validateEnv } from '../config/env.config';
+import type { Redis } from 'ioredis';
+
+// checkStellar() reads config.STELLAR_HEALTH_CHECK_TIMEOUT_MS / config.STELLAR_HORIZON_URL,
+// which requires validateEnv() to have run first — normally done once in main.ts (see
+// health.postgres-integration.spec.ts, rpc-failover.service.spec.ts).
+validateEnv();
 
 describe('HealthService', () => {
   const originalFetch = global.fetch;
@@ -41,6 +49,34 @@ describe('HealthService', () => {
     const status = await service.check();
 
     expect(status.checks.database).toBe(true);
+  });
+
+  it('reports redis: true when no Redis client is configured', async () => {
+    mockFetchOk(true);
+
+    const status = await new HealthService().check();
+
+    expect(status.checks.redis).toBe(true);
+  });
+
+  it('reports redis: true when Redis responds to ping', async () => {
+    mockFetchOk(true);
+    const redis = { ping: jest.fn().mockResolvedValue('PONG') } as unknown as any;
+
+    const status = await new HealthService(undefined, redis).check();
+
+    expect(status.checks.redis).toBe(true);
+    expect(redis.ping).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports degraded when Redis is unreachable', async () => {
+    mockFetchOk(true);
+    const redis = { ping: jest.fn().mockRejectedValue(new Error('Redis down')) } as unknown as any;
+
+    const status = await new HealthService(undefined, redis).check();
+
+    expect(status.checks.redis).toBe(false);
+    expect(status.status).toBe('degraded');
   });
 
   it('reports database: true when Postgres is not configured, without pinging', async () => {
@@ -93,6 +129,55 @@ describe('HealthService', () => {
     const status = await service.check();
 
     expect(status.status).toBe('ok');
-    expect(status.checks).toEqual({ api: true, stellar: true, database: true, memory: true });
+    expect(status.checks).toEqual({
+      api: true,
+      stellar: true,
+      database: true,
+      redis: true,
+      memory: true,
+      eventIngestion: true,
+      stellarProtocol: true,
+    });
+  });
+
+  it('reports eventIngestion: true when no IngestionHealthService is wired in (unit test wiring)', async () => {
+    mockFetchOk(true);
+
+    const status = await new HealthService().check();
+
+    expect(status.checks.eventIngestion).toBe(true);
+  });
+
+  it('reports stellarProtocol: true when no StellarProtocolCompatibilityService is wired in (unit test wiring)', async () => {
+    mockFetchOk(true);
+
+    const status = await new HealthService().check();
+
+    expect(status.checks.stellarProtocol).toBe(true);
+  });
+
+  it('reports stellarProtocol: false when the RPC protocol version is outside the tested range (#980)', async () => {
+    mockFetchOk(true);
+    const protocolCompatibility = {
+      getStatus: jest.fn().mockReturnValue({
+        checked: true,
+        compatible: false,
+        protocolVersion: 99,
+        minSupported: 20,
+        maxSupported: 22,
+      }),
+    } as unknown as any;
+
+    const status = await new HealthService(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      protocolCompatibility,
+    ).check();
+
+    expect(status.checks.stellarProtocol).toBe(false);
+    expect(status.status).toBe('degraded');
   });
 });

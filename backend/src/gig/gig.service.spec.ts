@@ -380,11 +380,20 @@ describe('GigService', () => {
         expect(cancelled.cancelledAt).toBeDefined();
       });
 
-      it('throws when the gig is not open', async () => {
+      it('throws when the gig is already cancelled or expired', async () => {
         const gig = await service.create(validDto);
         await service.cancel(gig.id);
 
         await expect(service.cancel(gig.id)).rejects.toThrow(BadRequestException);
+      });
+
+      it('cancels an accepted gig and records cancellation notice for counterparty', async () => {
+        const gig = await service.create(validDto);
+        await service.accept(gig.id, 'G' + 'D'.repeat(55));
+
+        const cancelled = await service.cancel(gig.id);
+        expect(cancelled.status).toBe(GigStatus.CANCELLED);
+        expect(cancelled.cancellationNotice).toContain('cancelled by creator after acceptance');
       });
     });
 
@@ -438,6 +447,15 @@ describe('GigService', () => {
         const updated = await service.update(gig.id, { title: 'New title' });
 
         expect(updated.respondBy).toBe(gig.respondBy);
+      });
+    });
+
+    describe('remove', () => {
+      it('throws when the gig has been accepted', async () => {
+        const gig = await service.create(validDto);
+        await service.accept(gig.id, 'GYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY');
+
+        await expect(service.remove(gig.id)).rejects.toThrow(BadRequestException);
       });
     });
 

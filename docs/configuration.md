@@ -56,3 +56,12 @@ The recommended option in this codebase is the existing Redis client:
    documented state (fail-open or fail-closed) rather than reading `undefined`.
 
 Until such a service exists, the restart requirement above is the supported behaviour.
+
+## Deliverable content hashes
+
+When a deliverable is submitted with both `content` and a client-supplied `fileHash`, the
+server recomputes the CIDv1 (raw, sha2-256) content hash from the decoded bytes. A
+`fileHash` in that format that disagrees with the recomputed value is rejected with 400
+before any provider is contacted, and the stored CID always comes from the server's pin
+result. A `fileHash` supplied without `content` cannot be verified (no bytes to hash), so
+it is stored with `PENDING` status.

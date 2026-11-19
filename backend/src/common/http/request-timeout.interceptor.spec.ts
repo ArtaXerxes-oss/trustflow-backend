@@ -170,6 +170,28 @@ describe('RequestTimeoutInterceptor', () => {
         done();
       });
     });
+
+    it('should exempt /api/docs-json routes', done => {
+      const mockRequest = { method: 'GET', path: '/api/docs-json' };
+      const mockContext = {
+        switchToHttp: () => ({
+          getRequest: () => mockRequest,
+        }),
+        getHandler: () => () => {},
+        getClass: () => class {},
+      } as unknown as ExecutionContext;
+
+      const mockCallHandler: CallHandler = {
+        handle: () => of({}).pipe(delay(1000)),
+      };
+
+      jest.spyOn(reflector, 'getAllAndOverride').mockReturnValue(undefined);
+
+      interceptor.intercept(mockContext, mockCallHandler).subscribe(result => {
+        expect(result).toBeDefined();
+        done();
+      });
+    });
   });
 
   describe('decorator overrides', () => {
