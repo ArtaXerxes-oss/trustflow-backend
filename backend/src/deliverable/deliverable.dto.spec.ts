@@ -1,14 +1,17 @@
 import { UploadDeliverableSchema } from './deliverable.dto';
 import { MAX_BASE64_CONTENT_LENGTH } from '../ipfs-pinning/ipfs-pinning.types';
+import { computeCidV1Raw } from '../ipfs-pinning/cid.util';
 
 const FREELANCER = 'G' + 'A'.repeat(55);
+const CONTENT = Buffer.from('test file').toString('base64');
 
-function parse(content: string) {
+function parse(content: string, extra: Record<string, unknown> = {}) {
   return UploadDeliverableSchema.safeParse({
     gigId: 'gig-1',
     freelancer: FREELANCER,
     content,
     filename: 'report.pdf',
+    ...extra,
   });
 }
 
@@ -64,5 +67,22 @@ describe('UploadDeliverableSchema content', () => {
 
   it('uses the same encoded-length cap as the IPFS pin endpoint', () => {
     expect(MAX_BASE64_CONTENT_LENGTH).toBe(14_316_560);
+  });
+});
+
+describe('UploadDeliverableSchema expectedCid', () => {
+  it('accepts a well-formed CIDv1 content hash', () => {
+    const expectedCid = computeCidV1Raw(Buffer.from('test file'));
+    expect(parse(CONTENT, { expectedCid }).success).toBe(true);
+  });
+
+  it('rejects a malformed client-supplied hash before any pinning occurs', () => {
+    const result = parse(CONTENT, { expectedCid: 'not-a-cid' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.errors.map(e => e.message)).toContain(
+        'expectedCid must be a valid CIDv1 raw sha2-256 string',
+      );
+    }
   });
 });

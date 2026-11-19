@@ -93,7 +93,9 @@ describe('Environment Configuration', () => {
 
     const { validateEnv: freshValidateEnv } = jest.requireActual('./env.config');
 
-    expect(() => freshValidateEnv()).toThrow('JWT_SECRET must be at least 32 characters in production');
+    expect(() => freshValidateEnv()).toThrow(
+      'JWT_SECRET must be at least 32 characters in production',
+    );
   });
 
   it('rejects placeholder JWT secrets in production', () => {
@@ -109,7 +111,9 @@ describe('Environment Configuration', () => {
 
     const { validateEnv: freshValidateEnv } = jest.requireActual('./env.config');
 
-    expect(() => freshValidateEnv()).toThrow('JWT_SECRET must not be a placeholder value in production');
+    expect(() => freshValidateEnv()).toThrow(
+      'JWT_SECRET must not be a placeholder value in production',
+    );
   });
 
   it('rejects PUBLIC network config with testnet URLs', () => {
@@ -137,6 +141,42 @@ describe('Environment Configuration', () => {
     const { validateEnv: freshValidateEnv } = jest.requireActual('./env.config');
 
     expect(() => freshValidateEnv()).toThrow('Environment variable validation failed');
+  });
+
+  it('names PORT in the startup error for a non-numeric value', () => {
+    process.env = {
+      JWT_SECRET: 'test-secret-at-least-16-chars',
+      PORT: 'abc',
+    };
+
+    const { validateEnv: freshValidateEnv } = jest.requireActual('./env.config');
+
+    expect(() => freshValidateEnv()).toThrow(/PORT/);
+  });
+
+  it('rejects out-of-range ports before the HTTP server is started', () => {
+    for (const port of ['0', '-1', '1.5', '65536']) {
+      jest.resetModules();
+      process.env = {
+        JWT_SECRET: 'test-secret-at-least-16-chars',
+        PORT: port,
+      };
+
+      const { validateEnv: freshValidateEnv } = jest.requireActual('./env.config');
+
+      expect(() => freshValidateEnv()).toThrow(/PORT/);
+    }
+  });
+
+  it('accepts a valid port at the upper boundary', () => {
+    process.env = {
+      JWT_SECRET: 'test-secret-at-least-16-chars',
+      PORT: '65535',
+    };
+
+    const { validateEnv: freshValidateEnv } = jest.requireActual('./env.config');
+
+    expect(freshValidateEnv().PORT).toBe(65535);
   });
 
   it('rejects incomplete database connection settings and invalid TLS booleans', () => {
@@ -242,6 +282,9 @@ describe('Environment Configuration', () => {
     process.env = {
       JWT_SECRET: 'test-secret-at-least-16-chars',
       STELLAR_NETWORK: 'MAINNET',
+      // MAINNET is a public network, so the endpoints must not be the testnet defaults.
+      STELLAR_HORIZON_URL: 'https://horizon.stellar.org',
+      SOROBAN_RPC_URL: 'https://soroban-rpc.stellar.org',
     };
 
     const { validateEnv: freshValidateEnv } = jest.requireActual('./env.config');

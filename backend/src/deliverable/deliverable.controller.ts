@@ -45,7 +45,10 @@ export class DeliverableController {
     description:
       'Only the freelancer who accepted the gig can upload for it: the gig must exist, be ' +
       "accepted, and `freelancer` must be both the gig's accepted freelancer and the " +
-      'authenticated wallet. `content` must be valid base64 of at most 10 MB decoded.',
+      'authenticated wallet. `content` must be valid base64 of at most 10 MB decoded. ' +
+      'If `expectedCid` is supplied, the server recomputes the content hash from the ' +
+      'uploaded bytes and rejects (400) a mismatched value; the stored CID is always ' +
+      'the server-computed one.',
   })
   @ApiBody({
     schema: {
@@ -60,6 +63,13 @@ export class DeliverableController {
           maxLength: MAX_BASE64_CONTENT_LENGTH,
         },
         filename: { type: 'string', example: 'audit-report.pdf' },
+        expectedCid: {
+          type: 'string',
+          description:
+            'Optional client-supplied CIDv1 content hash. Verified against the hash ' +
+            'recomputed from `content`; a mismatch is rejected with 400. Never trusted as-is.',
+          example: 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku',
+        },
       },
     },
   })

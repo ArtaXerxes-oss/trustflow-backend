@@ -209,10 +209,14 @@ export class IpfsPinningService implements OnModuleInit {
       }
     }
 
-    // Never top up replication for a pin the caller asked to remove.
-    const buffer = record.status === PinStatus.UNPINNING ? undefined : this.content.get(cid);
-    if (this.countHealthy(record) < record.replicationFactor && buffer) {
-      await this.replicate(record, buffer).catch(error => {
+    // Never top up replication for a pin the caller asked to remove. Original bytes are
+    // no longer retained after the initial pin, so a degraded pin cannot be topped up
+    // here; replicate() reports that explicitly instead of silently no-op'ing.
+    if (
+      record.status !== PinStatus.UNPINNING &&
+      this.countHealthy(record) < record.replicationFactor
+    ) {
+      await this.replicate(record).catch(error => {
         this.logger.warn(
           `Reconcile: unable to restore full replication for ${cid}: ${
             error instanceof Error ? error.message : String(error)
@@ -291,7 +295,6 @@ export class IpfsPinningService implements OnModuleInit {
     }
 
     record.status = PinStatus.UNPINNED;
-    this.content.delete(cid);
     await this.persist(record);
 
     await this.webhookService.dispatch(IPFS_EVENTS.PIN_REMOVED, { cid });

@@ -35,7 +35,17 @@ const EnvSchema = z
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 
     // Server configuration
-    PORT: z.coerce.number().int().positive().default(3001),
+    // Coercion alone is not enough: `.int().positive()` rejects non-numeric values such as
+    // `PORT=abc` (NaN) at validation time, and `.max(65535)` rejects values that would only
+    // fail later with an obscure `app.listen()` socket error. Bound the port so startup
+    // always fails fast with an error that names PORT.
+    PORT: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(65535)
+      .describe('HTTP port to listen on (1-65535)')
+      .default(3001),
     CORS_ORIGIN: z.preprocess(
       val => {
         if (typeof val !== 'string') return undefined;
@@ -318,10 +328,12 @@ const EnvSchema = z
     if (isProduction) {
       if (!secret || secret.trim() === '') {
         issue('JWT_SECRET', 'JWT_SECRET is required in production');
+      } else if (PLACEHOLDER_JWT_SECRETS.has(secret.trim().toLowerCase())) {
+        // Check known placeholders before length so a short placeholder gets the more
+        // actionable "do not ship this value" message rather than only a length warning.
+        issue('JWT_SECRET', 'JWT_SECRET must not be a placeholder value in production');
       } else if (secret.length < 32) {
         issue('JWT_SECRET', 'JWT_SECRET must be at least 32 characters in production');
-      } else if (PLACEHOLDER_JWT_SECRETS.has(secret.trim().toLowerCase())) {
-        issue('JWT_SECRET', 'JWT_SECRET must not be a placeholder value in production');
       }
     } else {
       // Development/test: if a value is explicitly provided it must still meet minimum length

@@ -25,6 +25,11 @@ describe('IpfsPinningService', () => {
   let webhookService: { dispatch: jest.Mock };
   let service: IpfsPinningService;
 
+  /** Pass-through mock: run the wrapped operation without any real breaker state. */
+  const circuitBreakerService = {
+    execute: jest.fn(async (_name: string, fn: () => Promise<unknown>) => fn()),
+  } as any;
+
   const CONTENT = Buffer.from('trustflow deliverable payload').toString('base64');
   const CID = computeCidV1Raw(Buffer.from('trustflow deliverable payload'));
 
@@ -33,11 +38,17 @@ describe('IpfsPinningService', () => {
     web3Storage = makeProvider(PinProviderName.WEB3_STORAGE);
     infura = makeProvider(PinProviderName.INFURA);
     webhookService = { dispatch: jest.fn().mockResolvedValue(undefined) };
-    service = new IpfsPinningService([pinata, web3Storage, infura], webhookService as any);
+    service = new IpfsPinningService(
+      [pinata, web3Storage, infura],
+      webhookService as any,
+      circuitBreakerService,
+    );
   });
 
   it('throws on construction with no providers', () => {
-    expect(() => new IpfsPinningService([], webhookService as any)).toThrow();
+    expect(
+      () => new IpfsPinningService([], webhookService as any, circuitBreakerService),
+    ).toThrow();
   });
 
   describe('pinContent', () => {
@@ -134,7 +145,9 @@ describe('IpfsPinningService', () => {
       await service.pinContent({ content: CONTENT }); // pinned to pinata + web3Storage
 
       pinata.verify.mockResolvedValue(false); // pinata silently lost the pin
-      await expect(service.reconcile(CID)).rejects.toThrow('original content is no longer retained');
+      await expect(service.reconcile(CID)).rejects.toThrow(
+        'original content is no longer retained',
+      );
       expect(webhookService.dispatch).toHaveBeenCalledWith(
         IPFS_EVENTS.PIN_LOST,
         expect.objectContaining({ cid: CID, provider: PinProviderName.PINATA }),
@@ -257,14 +270,13 @@ describe('IpfsPinningService', () => {
         });
       });
 
-      it('retains the content so the record is not left unrecoverable', async () => {
+      it('does not retain original bytes; a later replication retry must fail explicitly', async () => {
         await pinThenFailWeb3Storage();
         await unpinRejection();
-
-        // Content is only dropped once the removal completes.
-        expect((service as any).content.has(CID)).toBe(true);
         await service.unpin(CID);
-        expect((service as any).content.has(CID)).toBe(false);
+
+        // Byte retention was removed by design — no hidden per-process content cache.
+        expect((service as any).content).toBeUndefined();
       });
 
       it('counts the failure in metrics', async () => {
@@ -272,6 +284,7 @@ describe('IpfsPinningService', () => {
         service = new IpfsPinningService(
           [pinata, web3Storage, infura],
           webhookService as any,
+          circuitBreakerService,
           null,
           metrics as any,
         );
@@ -323,7 +336,7 @@ describe('IpfsPinningService', () => {
 
     it('treats an unregistered provider name as a failure, not a success', async () => {
       const providers = [pinata, web3Storage, infura];
-      service = new IpfsPinningService(providers, webhookService as any);
+      service = new IpfsPinningService(providers, webhookService as any, circuitBreakerService);
       await service.pinContent({ content: CONTENT });
       providers.splice(providers.indexOf(web3Storage), 1);
 

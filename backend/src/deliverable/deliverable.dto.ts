@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { MAX_BASE64_CONTENT_LENGTH } from '../ipfs-pinning/ipfs-pinning.types';
+import { isValidCidV1Raw } from '../ipfs-pinning/cid.util';
 
 const STELLAR_ADDRESS_REGEX = /^G[A-Z2-7]{55}$/;
 
@@ -29,6 +30,14 @@ export const UploadDeliverableSchema = z.object({
       message: 'content must be valid base64',
     }),
   filename: z.string().min(1).max(255),
+  // Optional client-supplied content hash. It is NEVER trusted as-is: it is passed to
+  // the IPFS pinning service, which recomputes the CID from the uploaded bytes and
+  // rejects the request with 400 when the two disagree. A valid hash here is therefore
+  // a claim to verify, not a value that is stored on faith.
+  expectedCid: z
+    .string()
+    .refine(isValidCidV1Raw, 'expectedCid must be a valid CIDv1 raw sha2-256 string')
+    .optional(),
 });
 
 export type UploadDeliverableDto = z.infer<typeof UploadDeliverableSchema>;

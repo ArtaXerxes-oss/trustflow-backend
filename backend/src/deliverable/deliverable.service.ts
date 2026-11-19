@@ -39,9 +39,14 @@ export class DeliverableService {
     const id = `del-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const now = new Date().toISOString();
 
+    // Pass the client's claimed content hash through to pinContent, which recomputes the
+    // CID from the decoded bytes and rejects a mismatch *before* contacting any provider.
+    // The stored CID always comes from pinResult (the server-computed value), never from
+    // the client-supplied expectedCid.
     const pinResult = await this.ipfsPinningService.pinContent({
       content: dto.content,
       filename: dto.filename,
+      ...(dto.expectedCid ? { expectedCid: dto.expectedCid } : {}),
     });
 
     const deliverable: Deliverable = {

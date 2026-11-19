@@ -1,5 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { DeliverableService } from './deliverable.service';
 import { IpfsPinningService } from '../ipfs-pinning/ipfs-pinning.service';
 import { GigService } from '../gig/gig.service';
@@ -7,6 +12,7 @@ import { Gig, GigStatus } from '../gig/gig.entity';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { UploadDeliverableDto } from './deliverable.dto';
 import { DeliverableStatus } from './deliverable.entity';
+import { computeCidV1Raw } from '../ipfs-pinning/cid.util';
 
 const FREELANCER = 'G' + 'A'.repeat(55);
 const OTHER_WALLET = 'G' + 'B'.repeat(55);
@@ -83,6 +89,33 @@ describe('DeliverableService', () => {
         content: dto.content,
         filename: dto.filename,
       });
+    });
+
+    it('passes a client-supplied hash through for server-side verification', async () => {
+      const expectedCid = computeCidV1Raw(Buffer.from('test file'));
+      mockIpfsPinningService.pinContent.mockResolvedValue({ cid: expectedCid, size: 9 });
+
+      await service.upload({ ...dto, expectedCid }, FREELANCER);
+
+      expect(mockIpfsPinningService.pinContent).toHaveBeenCalledWith({
+        content: dto.content,
+        filename: dto.filename,
+        expectedCid,
+      });
+    });
+
+    it('does not store a deliverable when the client-supplied hash does not match the bytes', async () => {
+      const expectedCid = computeCidV1Raw(Buffer.from('different file'));
+      mockIpfsPinningService.pinContent.mockRejectedValue(
+        new BadRequestException(
+          `Content hash mismatch: expected ${expectedCid}, computed a different CID from the supplied bytes`,
+        ),
+      );
+
+      await expect(service.upload({ ...dto, expectedCid }, FREELANCER)).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(await service.findByGig(dto.gigId)).toEqual([]);
     });
 
     it('can retrieve uploaded deliverable by ID', async () => {

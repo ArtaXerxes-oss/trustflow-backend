@@ -41,11 +41,11 @@ export class CircuitBreakerService {
     });
 
     breaker.on('halfOpen', () => {
-      this.logger.info(`Circuit breaker "${name}" is now HALF_OPEN. Attempting recovery.`);
+      this.logger.log(`Circuit breaker "${name}" is now HALF_OPEN. Attempting recovery.`);
     });
 
     breaker.on('close', () => {
-      this.logger.info(`Circuit breaker "${name}" is now CLOSED. Service recovered.`);
+      this.logger.log(`Circuit breaker "${name}" is now CLOSED. Service recovered.`);
     });
 
     this.breakers.set(name, breaker);
@@ -61,7 +61,7 @@ export class CircuitBreakerService {
       options,
     );
 
-    return breaker.fire();
+    return (await breaker.fire()) as T;
   }
 
   getStatus(name: string): { state: string; stats: Record<string, unknown> } | null {
